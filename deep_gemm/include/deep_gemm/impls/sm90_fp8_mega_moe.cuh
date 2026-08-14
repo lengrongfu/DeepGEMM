@@ -565,7 +565,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 issue_and_wait_pull_store(kNumChunks - 1);
                 ptx::red_add_rel(
-                    workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
+                    workspace.get_l1_full_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
             }
             __syncwarp();
         }
@@ -602,8 +602,8 @@ sm90_fp8_mega_moe_impl(void* y,
                 __syncwarp();
 
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-                    *workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + j) = 0;
-                    *workspace.get_l2_arrival_mask_ptr(expert_pool_block_offset + j)  = 0;
+                    *workspace.get_l1_full_count_ptr(expert_pool_block_offset + j) = 0;
+                    *workspace.get_l2_full_count_ptr(expert_pool_block_offset + j)  = 0;
                 }
                 __syncwarp();
             }
@@ -643,18 +643,18 @@ sm90_fp8_mega_moe_impl(void* y,
 
             // Wait for the pool to be ready
             if (block_phase == sched::BlockPhase::Linear1) {
-                const auto ptr      = workspace.get_l1_arrival_count_ptr(pool_block_idx);
+                const auto ptr      = workspace.get_l1_full_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
                 while (ptx::ld_acq(ptr) != expected)
                     ;
             } else {
-                const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                // Each L1 N block sets one bit; total bits = L1_SHAPE_N / BLOCK_N.
+                const auto ptr = workspace.get_l2_full_count_ptr(pool_block_idx);
+                // Each L1 N block increments this counter exactly once (see the
+                // `l1_store_pending`-guarded `red_add_rel` sites below), so
+                // waiting for the count to reach the total N-block count is
+                // equivalent to the original bitmask's "all bits set" check.
                 constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-                const uint64_t expected          = (kNumL1BlockNs >= 64)
-                                                       ? ~0ull
-                                                       : ((1ull << kNumL1BlockNs) - 1ull);
-                while (ptx::ld_acq_gpu(ptr) != expected)
+                while (ptx::ld_acq(ptr) != kNumL1BlockNs)
                     ;
             }
 
@@ -802,9 +802,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    ptx::red_or_rel_gpu(
-                        workspace.get_l2_arrival_mask_ptr(l1_pending_pool_block_idx),
-                        1ull << l1_pending_n_block_idx);
+                    ptx::red_add_rel(workspace.get_l2_full_count_ptr(l1_pending_pool_block_idx), 1u);
                 }
                 l1_store_pending = false;
             }
@@ -1088,9 +1086,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 if (l1_store_pending) {
                     ptx::tma_store_wait<1>();
                     if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                        ptx::red_or_rel_gpu(
-                            workspace.get_l2_arrival_mask_ptr(l1_pending_pool_block_idx),
-                            1ull << l1_pending_n_block_idx);
+                        ptx::red_add_rel(workspace.get_l2_full_count_ptr(l1_pending_pool_block_idx), 1u);
                     }
                 }
                 l1_store_pending          = true;
@@ -1174,9 +1170,7 @@ sm90_fp8_mega_moe_impl(void* y,
             ptx::tma_store_wait<0>();
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                ptx::red_or_rel_gpu(
-                    workspace.get_l2_arrival_mask_ptr(l1_pending_pool_block_idx),
-                    1ull << l1_pending_n_block_idx);
+                ptx::red_add_rel(workspace.get_l2_full_count_ptr(l1_pending_pool_block_idx), 1u);
             }
             l1_store_pending = false;
         }
