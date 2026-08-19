@@ -122,6 +122,60 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), sf
 
 
+def get_nvfp4_global_scale(x: torch.Tensor) -> torch.Tensor:
+    """Compute the per-tensor fp32 global scale used by NVFP4's two-level scaling scheme
+    (NVIDIA Model Optimizer convention): `global_scale = amax(x) / (E2M1_MAX * E4M3_MAX)`.
+    For weights this is normally pre-computed offline and shipped in the checkpoint as
+    `*.weight_scale_2`; this helper is for cases (e.g. tests) where it must be derived locally."""
+    e2m1_max, e4m3_max = 6.0, 448.0
+    amax = x.abs().float().amax().clamp_min(1e-12)
+    return (amax / (e2m1_max * e4m3_max)).view(1)
+
+
+def per_block_cast_to_nvfp4(x: torch.Tensor, global_scale: torch.Tensor,
+                            gran_k: int = 16) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize `x` to packed e2m1 with per-16-element-block e4m3 scales, given a
+    pre-computed (or checkpoint-provided) fp32 `global_scale` scalar.
+
+    Formula (verified against NVIDIA Model Optimizer's `nvfp4_tensor.py`):
+        block_scale = clamp(block_amax / (E2M1_MAX * global_scale), 2**-9, 448) -> cast to e4m3
+        quantized   = x / (block_scale.float() * global_scale)                 -> encode to e2m1
+    NOTE: this is NOT the same formula as `per_token_cast_to_fp4` (single-level UE8M0 scaling
+    used by the existing MXFP4 kernel) -- NVFP4 always needs a `global_scale` from outside
+    (dynamically derived for activations via `get_nvfp4_global_scale`, or loaded from the
+    checkpoint's `*.weight_scale_2` / `*.input_scale` for weights/calibrated activations).
+    """
+    e2m1_max = 6.0
+    assert global_scale.numel() == 1
+    m, n = x.shape
+    assert n % gran_k == 0
+    gs = global_scale.item()
+    x_view = x.view(m, n // gran_k, gran_k)
+    block_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-12)
+    block_scale_f32 = (block_amax / (e2m1_max * gs)).clamp(2 ** -9, 448.0)
+    block_scale = block_scale_f32.to(torch.float8_e4m3fn)
+    x_scaled = x_view / (block_scale.float().unsqueeze(2) * gs)
+    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, n)
+    codes2 = codes.view(m, n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    return packed.contiguous(), block_scale.contiguous()
+
+
+def cast_back_from_nvfp4(packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor,
+                         gran_k: int = 16) -> torch.Tensor:
+    """Inverse of `per_block_cast_to_nvfp4`, for numerical reference/testing only."""
+    m, n2 = packed.shape
+    n = n2 * 2
+    gs = global_scale.item()
+    unpacked = torch.zeros((m, n), dtype=torch.int8, device=packed.device)
+    unpacked[:, ::2] = packed & 0x0F
+    unpacked[:, 1::2] = (packed >> 4) & 0x0F
+    x_dequantized = _dequantize_from_fp4_e2m1(unpacked)
+    group_idx = torch.arange(n, device=packed.device) // gran_k
+    combined_scale = block_scale.float()[:, group_idx] * gs
+    return x_dequantized * combined_scale
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2

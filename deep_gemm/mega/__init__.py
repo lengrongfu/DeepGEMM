@@ -181,6 +181,52 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         situ_beta, situ_linear_beta
     )
 
+def nvfp4_mega_moe(y: torch.Tensor,
+                   l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                   l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                   sym_buffer: SymmBuffer,
+                   input_scale_l1: float, input_scale_l2: float,
+                   shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                   shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                   recipe: Tuple[int, int, int] = (1, 1, 16),
+                   activation: str = 'swiglu',
+                   activation_clamp: Optional[float] = None,
+                   fast_math: bool = True):
+    """NVFP4 (e2m1 weights AND activations, UE4M3 16-element block scales) MegaMoE.
+
+    NOTES: unlike `fp8_fp4_mega_moe` (MXFP8FP4: FP8 activations x FP4 weights), this
+    quantizes BOTH weights and activations to NVFP4, matching how
+    `nvidia/DeepSeek-V4-Flash-NVFP4` quantizes its MoE expert layers (verified against
+    the checkpoint's `hf_quant_config.json`: `quant_algo=NVFP4, group_size=16` for
+    `*.ffn.experts.*`, with `*.ffn.shared_experts.*` explicitly excluded).
+
+    `input_scale_l1`/`input_scale_l2` are the pre-calibrated per-tensor fp32 global scales
+    for the L1 (dispatched token) and L2 (post-SwiGLU) activations respectively -- for L1
+    these should come from the checkpoint's `*.w1.input_scale` (gate) / `*.w3.input_scale`
+    (up) -- see the KNOWN GAP note in `csrc/apis/mega.hpp` re: reconciling gate/up global
+    scales when interleaving `w1`/`w3` into one combined `l1_weights` tensor.
+
+    KNOWN GAP: the CUDA epilogue that quantizes SwiGLU output for the L2 GEMM has not been
+    finished (see the FIXME block in `sm100_nvfp4_mega_moe.cuh`'s epilogue) -- this Python
+    entry point is wired up but end-to-end correctness has not been validated on real SM100
+    hardware (no CUDA toolchain/GPU was available while writing this).
+    """
+    _C.nvfp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        input_scale_l1, input_scale_l2
+    )
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,

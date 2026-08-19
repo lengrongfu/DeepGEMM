@@ -16,10 +16,16 @@ struct SM100ArchSpec {
 
     static std::pair<int, int> get_sf_uttcp_aligned_block_sizes(
         const int& block_m, const int& block_n, const MmaKind& mma_kind) {
+        // NOTES: the UTCCP copy atom aligns to 128 elements regardless of the scale-factor
+        // block granularity (32 for MXFP8FP4/UE8M0, 16 for NVFP4/UE4M3) -- see the SM100 UMMA
+        // instruction descriptor, which only carries a 1-bit `scale_format_` field and no
+        // separate vector-size field; the granularity is implied by the scale dtype at the ISA level.
         constexpr int num_utccp_aligned_elems = 128;
         switch (mma_kind) {
             case MmaKind::BF16: return {0, 0};
-            case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case MmaKind::MXFP8FP4:
+            case MmaKind::NVFP4:
+                return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
@@ -122,7 +128,12 @@ struct SM100ArchSpec {
 
                             // Check tensor memory capacity
                             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, desc.get_mma_kind());
-                            const auto tmem_sf_cols = desc.get_mma_kind() == MmaKind::MXFP8FP4 ? sf_block_m / 32 + sf_block_n / 32 : 0;
+                            // NOTES: the `/32` here is the UTCCP `4x32dp128bit` copy atom's fixed M-dimension
+                            // packing width (4 tmem columns x 32 rows per 128-row UTCCP chunk); it is a hardware
+                            // copy-atom geometry constant, NOT the scale-factor K-block granularity (gran_k),
+                            // so it stays 32 for both MXFP8FP4 (gran_k=32) and NVFP4 (gran_k=16).
+                            const auto tmem_sf_cols = is_mma_with_sf(desc.get_mma_kind()) ?
+                                sf_block_m / 32 + sf_block_n / 32 : 0;
                             const auto umma_n = swap_ab ? block_m : block_n;
                             if (2 * umma_n + tmem_sf_cols > 512)
                                 continue;
