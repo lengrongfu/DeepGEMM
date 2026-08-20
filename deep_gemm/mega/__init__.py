@@ -175,6 +175,45 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math
     )
 
+def fp4_fp4_mega_moe(y: torch.Tensor,
+                     l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                     l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                     sym_buffer: SymmBuffer,
+                     shared_l1_weights: Optional[torch.Tensor] = None,
+                     shared_l2_weights: Optional[torch.Tensor] = None,
+                     x_bf16: Optional[torch.Tensor] = None,
+                     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                     recipe: Tuple[int, int, int] = (1, 1, 16),
+                     activation: str = 'swiglu',
+                     activation_clamp: Optional[float] = None,
+                     fast_math: bool = True,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None,
+                     a2_scales: Optional[torch.Tensor] = None,
+                     routed_scaling_factor: float = 1.0):
+    """Run NVFP4 routed experts, optionally fused with BF16 shared experts.
+
+    NVFP4 operands use packed E2M1 values and per-16-element E4M3 scales.
+    ``l1_alphas``, ``l2_alphas`` and ``a2_scales`` carry optional per-expert
+    model scales. Shared weights and ``x_bf16`` must be provided together;
+    ``routed_scaling_factor`` is applied before adding their BF16 output.
+    """
+    assert (shared_l1_weights is None) == (shared_l2_weights is None) == (x_bf16 is None)
+    _C.fp4_fp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights, x_bf16,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        l1_alphas, l2_alphas, a2_scales, routed_scaling_factor
+    )
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,
