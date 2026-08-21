@@ -343,7 +343,12 @@ def _run_scenario(
     from deep_gemm.utils import per_token_cast_to_fp8
 
     num_max_tokens = config['num_max_tokens_per_rank']
-    num_tokens = config.get('num_tokens', num_max_tokens)
+    num_tokens_by_rank = config.get('num_tokens_by_rank')
+    if num_tokens_by_rank is None:
+        num_tokens = config.get('num_tokens', num_max_tokens)
+    else:
+        assert len(num_tokens_by_rank) == num_ranks
+        num_tokens = num_tokens_by_rank[rank_idx]
     hidden = config['hidden']
     intermediate_hidden = config['intermediate_hidden']
     num_experts = config['num_experts']
@@ -402,14 +407,26 @@ def _run_scenario(
     l2_quantized = _quantize_grouped_mxfp4(l2_bf16)
     del l2_bf16
 
-    scores = torch.randn(
-        num_tokens, num_experts, dtype=torch.float32, device='cuda')
-    topk_weights, topk_idx = torch.topk(
-        scores, num_topk, dim=-1, largest=True, sorted=False)
-    if config.get('require_ring_wrap', False):
-        topk_idx = _make_forced_ring_wrap_topk_idx(
-            num_tokens, num_topk, num_experts,
-            rank_idx, num_ranks, scores.device)
+    hot_route_rank = config.get('hot_route_rank')
+    if hot_route_rank is None:
+        scores = torch.randn(
+            num_tokens, num_experts, dtype=torch.float32, device='cuda')
+        topk_weights, topk_idx = torch.topk(
+            scores, num_topk, dim=-1, largest=True, sorted=False)
+        if config.get('require_ring_wrap', False):
+            topk_idx = _make_forced_ring_wrap_topk_idx(
+                num_tokens, num_topk, num_experts,
+                rank_idx, num_ranks, scores.device)
+    else:
+        assert 0 <= hot_route_rank < num_ranks
+        assert num_topk <= num_local_experts
+        hot_expert_start = hot_route_rank * num_local_experts
+        topk_idx = (
+            torch.arange(num_topk, dtype=torch.int64, device='cuda') +
+            hot_expert_start
+        ).expand(num_tokens, -1).clone()
+        topk_weights = torch.randn(
+            num_tokens, num_topk, dtype=torch.float32, device='cuda')
     if masked_ratio:
         mask = torch.rand_like(topk_idx, dtype=torch.float32) < masked_ratio
         topk_idx.masked_fill_(mask, -1)
@@ -878,6 +895,53 @@ def _full_scenarios(
             require_ring_wrap=True,
         )),
     ]
+    if num_ranks > 1:
+        scenarios.extend([
+            ('swap_ab_cross_rank_bound.flash_m8', dict(
+                num_max_tokens_per_rank=128,
+                num_tokens=8,
+                hidden=4096,
+                intermediate_hidden=2048,
+                num_experts=32 * num_ranks,
+                num_topk=6,
+                fast_math=True,
+                activation_clamp=10.0,
+                hot_route_rank=0,
+            )),
+            ('swap_ab_cross_rank_bound.flash_m16', dict(
+                num_max_tokens_per_rank=128,
+                num_tokens=16,
+                hidden=4096,
+                intermediate_hidden=2048,
+                num_experts=32 * num_ranks,
+                num_topk=6,
+                fast_math=True,
+                activation_clamp=10.0,
+                hot_route_rank=0,
+            )),
+            ('dispatch_mixed_protocol.flash_m32_m64', dict(
+                num_max_tokens_per_rank=128,
+                num_tokens_by_rank=(32,) + (64,) * (num_ranks - 1),
+                hidden=4096,
+                intermediate_hidden=2048,
+                num_experts=32 * num_ranks,
+                num_topk=6,
+                fast_math=True,
+                activation_clamp=10.0,
+                hot_route_rank=1,
+            )),
+            ('dispatch_mixed_protocol.flash_m1024_m64', dict(
+                num_max_tokens_per_rank=1024,
+                num_tokens_by_rank=(1024,) + (64,) * (num_ranks - 1),
+                hidden=4096,
+                intermediate_hidden=2048,
+                num_experts=32 * num_ranks,
+                num_topk=6,
+                fast_math=True,
+                activation_clamp=10.0,
+                hot_route_rank=1,
+            )),
+        ])
     rng = random.Random(0xC0FFEE)
     for index in range(stress_count):
         num_tokens = rng.choice((32, 64, 128, 256, 512))

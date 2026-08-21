@@ -104,10 +104,16 @@ public:
             args.num_shared_experts == 0 and
             ((args.hidden == 4096 and args.num_tokens <= 128) or
              (args.hidden == 7168 and args.num_tokens <= 128));
-        const uint32_t max_swap_ab_tokens =
+        const uint32_t local_swap_ab_tokens =
             args.num_tokens <= 8 ? 8 :
             args.num_tokens <= 16 ? 16 :
             args.num_tokens <= 32 ? 32 : 64;
+        // `num_tokens` is rank-local, while one local expert can receive a
+        // full M64 block from all source ranks (including uneven-rank input).
+        // Preserve the local bucket for policy selection, but use a separate
+        // cross-rank-safe bound for epilogue storage.
+        const uint32_t max_swap_ab_tokens =
+            args.num_ranks > 1 ? 64 : local_swap_ab_tokens;
         const bool packed_bf16_swap_epilogue =
             args.num_shared_experts == 0 and
             ((args.hidden == 4096 and
@@ -151,6 +157,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -165,6 +172,7 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     small_m_swap_ab ? "true" : "false",
     max_swap_ab_tokens,
+    local_swap_ab_tokens,
     packed_bf16_swap_epilogue ? "true" : "false",
     swizzle_l2_cd ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",

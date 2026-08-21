@@ -232,6 +232,45 @@ def _benchmark_case(
             topk_idx.masked_fill_(mask, -1)
             topk_weights.masked_fill_(mask, 0.0)
 
+        route_stats = None
+        if args.report_route_stats:
+            if num_ranks == 1:
+                global_topk_idx = topk_idx
+            else:
+                from deep_gemm.utils.dist import uneven_all_gather
+
+                global_topk_idx = uneven_all_gather(topk_idx, group=group)
+            valid_topk_idx = global_topk_idx[global_topk_idx >= 0].long()
+            global_recv_counts = torch.bincount(
+                valid_topk_idx, minlength=num_experts
+            ).reshape(num_ranks, num_local_experts)
+            routed_m_blocks = torch.div(
+                global_recv_counts + 63, 64, rounding_mode="floor"
+            )
+            if rank_idx == 0:
+                route_stats = [
+                    {
+                        "rank": route_rank,
+                        "recv_tokens": int(
+                            global_recv_counts[route_rank].sum().item()
+                        ),
+                        "m_blocks": int(
+                            routed_m_blocks[route_rank].sum().item()
+                        ),
+                        "experts_over_block_m": int(
+                            (global_recv_counts[route_rank] > 64).sum().item()
+                        ),
+                        "max_expert_tokens": int(
+                            global_recv_counts[route_rank].max().item()
+                        ),
+                        "expert_counts": global_recv_counts[
+                            route_rank
+                        ].cpu().tolist(),
+                    }
+                    for route_rank in range(num_ranks)
+                ]
+            del global_topk_idx, valid_topk_idx
+
         transformed_shared_l1: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         transformed_shared_l2: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if num_shared_experts > 0:
@@ -319,6 +358,11 @@ def _benchmark_case(
             "masked_ratio": args.masked_ratio,
             "seed": args.seed,
         }
+        if route_stats is not None:
+            _emit_json(
+                "BENCH_ROUTE_JSON",
+                {**case_metadata, "block_m": 64, "per_rank": route_stats},
+            )
 
         if args.profile_only:
             if rank_idx == 0:
@@ -375,6 +419,23 @@ def _benchmark_case(
             if num_ranks > 1:
                 dist.all_reduce(max_rank_time, op=dist.ReduceOp.MAX, group=group)
 
+            rank_times_us = None
+            if args.report_rank_times:
+                gathered_rank_times = [
+                    torch.zeros_like(max_rank_time) for _ in range(num_ranks)
+                ]
+                if num_ranks > 1:
+                    dist.all_gather(
+                        gathered_rank_times, max_rank_time.new_tensor(kernel_time),
+                        group=group,
+                    )
+                else:
+                    gathered_rank_times[0].copy_(max_rank_time)
+                rank_times_us = [
+                    rank_time.item() * 1e6
+                    for rank_time in gathered_rank_times
+                ]
+
             rank0_observations.append(kernel_time)
             max_rank_observations.append(max_rank_time.item())
             if rank_idx == 0:
@@ -389,6 +450,10 @@ def _benchmark_case(
                         "num_tests": args.num_tests,
                         "flush_l2": bool(args.flush_l2),
                         "cache_mode": _cache_mode(args.flush_l2),
+                        **(
+                            {"rank_times_us": rank_times_us}
+                            if rank_times_us is not None else {}
+                        ),
                     },
                 )
 
@@ -535,6 +600,16 @@ def _parse_args() -> argparse.Namespace:
         help="1 flushes L2 before each sample; 0 disables the explicit flush",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--report-rank-times",
+        action="store_true",
+        help="include every rank's local kernel time in BENCH_OBS_JSON",
+    )
+    parser.add_argument(
+        "--report-route-stats",
+        action="store_true",
+        help="emit per-rank receive counts and routed M64 block counts",
+    )
     parser.add_argument("--masked-ratio", type=float, default=0.0)
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1)
