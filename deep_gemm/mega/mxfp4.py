@@ -11,7 +11,7 @@ import torch
 
 
 MXFP4CheckpointWeights = Tuple[torch.Tensor, torch.Tensor]
-_MXFP4Payload = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+MXFP4ProcessedWeights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 _SM90_MXFP4_COALESCED_SCALE_MAX_HIDDEN = 8192
 
 
@@ -23,41 +23,6 @@ def _is_valid_sm90_mxfp4_hidden_size(hidden: int) -> bool:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
-
-
-class MXFP4ProcessedWeights(tuple):
-    """Validated tuple payload produced by the SM90 MXFP4 transform.
-
-    A tuple subclass preserves the public/PyBind tuple ABI while distinguishing
-    transformed relative-UE8M0 payloads from raw checkpoint triplets. Semantic
-    validation happens once at model-load or deserialization time instead of
-    scanning the full scale tensor before every kernel launch.
-    """
-
-    __slots__ = ()
-
-    def __new__(cls, values: _MXFP4Payload) -> 'MXFP4ProcessedWeights':
-        if not isinstance(values, tuple) or len(values) != 3:
-            raise TypeError(
-                'SM90 processed MXFP4 weights require a three-tensor tuple')
-        weight, relative_sf, secondary = values
-        if not all(isinstance(tensor, torch.Tensor) for tensor in values):
-            raise TypeError('SM90 processed MXFP4 entries must be torch.Tensor objects')
-        if relative_sf.dtype != torch.uint8:
-            raise TypeError('SM90 relative UE8M0 scales must have dtype uint8')
-        _require(
-            bool(((relative_sf >= 1) & (relative_sf <= 12)).all().item()),
-            'SM90 processed MXFP4 requires relative UE8M0 values in [1, 12]')
-        if secondary.dtype != torch.float32:
-            raise TypeError('SM90 MXFP4 secondary scale must have dtype float32')
-        _require(
-            bool(torch.isfinite(secondary).all().item()) and
-            bool((secondary > 0).all().item()),
-            'SM90 MXFP4 secondary scale must contain finite positive values')
-        return super().__new__(cls, (weight, relative_sf, secondary))
-
-    def __getnewargs__(self) -> Tuple[_MXFP4Payload]:
-        return (tuple(self),)
 
 
 def _normalize_mxfp4_ue8m0(sf: torch.Tensor) -> torch.Tensor:
@@ -254,7 +219,7 @@ def _process_mxfp4_e8m0(
     weight: torch.Tensor,
     sf: torch.Tensor,
     interleave_rows: bool = False,
-) -> _MXFP4Payload:
+) -> MXFP4ProcessedWeights:
     """Convert raw UE8M0 scales to bounded per-expert exponent offsets.
 
     The retained relative exponent range is 11, matching Humming's fused-E8M0
@@ -353,12 +318,7 @@ def _apply_weight_scale_2(
              f'{name}_weight_scale_2 must contain only finite values')
     _require(bool((scale > 0).all().item()),
              f'{name}_weight_scale_2 must contain only positive values')
-    result = (secondary * scale).contiguous()
-    _require(
-        bool(torch.isfinite(result).all().item()) and
-        bool((result > 0).all().item()),
-        f'{name}_weight_scale_2 result must contain finite positive values')
-    return result
+    return (secondary * scale).contiguous()
 
 
 def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
@@ -399,15 +359,15 @@ def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
         l1_sf = _transpose_mxfp4_scales_for_sm90(l1_sf)
         l2_sf = _transpose_mxfp4_scales_for_sm90(l2_sf)
 
-    return MXFP4ProcessedWeights((
+    return (
         l1_w,
         l1_sf,
         l1_secondary,
-    )), MXFP4ProcessedWeights((
+    ), (
         l2_w.contiguous(),
         l2_sf.contiguous(),
         l2_secondary,
-    ))
+    )
 
 
 def _validate_processed_mxfp4_kernel_weights(
@@ -465,7 +425,3 @@ def _validate_processed_mxfp4_kernel_weights(
                  f'{name}_weight_scale_2 must be on the weight device')
         _require(scale.is_contiguous(),
                  f'{name}_weight_scale_2 must be contiguous before launch')
-    if not isinstance(l1_weights, MXFP4ProcessedWeights) or \
-            not isinstance(l2_weights, MXFP4ProcessedWeights):
-        raise ValueError(
-            'L1/L2 SM90 MXFP4 weights must be returned by the SM90 transform')

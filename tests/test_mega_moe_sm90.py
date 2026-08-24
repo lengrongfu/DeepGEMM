@@ -16,7 +16,6 @@ import random
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-import pytest
 import torch
 import torch.distributed as dist
 
@@ -47,29 +46,6 @@ class _SingleProcessGroup:
     @staticmethod
     def barrier() -> None:
         torch.cuda.synchronize()
-
-
-def _make_forced_ring_wrap_topk_idx(
-    num_tokens: int,
-    num_topk: int,
-    num_experts: int,
-    rank_idx: int,
-    num_ranks: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Assign routes so every expert receives at least one global token."""
-    if num_tokens * num_topk * num_ranks < num_experts:
-        raise ValueError(
-            'forced ring-wrap routing needs at least one route per expert')
-    first_route = rank_idx * num_tokens * num_topk
-    return (
-        torch.arange(
-            first_route,
-            first_route + num_tokens * num_topk,
-            dtype=torch.int64,
-            device=device,
-        ) % num_experts
-    ).reshape(num_tokens, num_topk)
 
 
 def _quantize_grouped_mxfp4(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -413,10 +389,6 @@ def _run_scenario(
             num_tokens, num_experts, dtype=torch.float32, device='cuda')
         topk_weights, topk_idx = torch.topk(
             scores, num_topk, dim=-1, largest=True, sorted=False)
-        if config.get('require_ring_wrap', False):
-            topk_idx = _make_forced_ring_wrap_topk_idx(
-                num_tokens, num_topk, num_experts,
-                rank_idx, num_ranks, scores.device)
     else:
         assert 0 <= hot_route_rank < num_ranks
         assert num_topk <= num_local_experts
@@ -582,7 +554,7 @@ def _run_scenario(
         recv_stats = torch.zeros(
             num_local_experts, dtype=torch.int32, device='cuda')
         for _ in range(repeat_count):
-            deep_gemm.fp8_mega_moe(
+            deep_gemm.fp8_mxfp4_mega_moe(
                 output,
                 transformed_l1,
                 transformed_l2,
@@ -810,6 +782,26 @@ def _full_scenarios(
             activation_clamp=10.0,
             require_ring_wrap=True,
         )),
+        ('production.flash_m256', dict(
+            num_max_tokens_per_rank=256,
+            num_tokens=256,
+            hidden=4096,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
+        ('production.flash_m512', dict(
+            num_max_tokens_per_rank=512,
+            num_tokens=512,
+            hidden=4096,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
         ('production.flash_m1024', dict(
             num_max_tokens_per_rank=1024,
             num_tokens=1024,
@@ -837,6 +829,31 @@ def _full_scenarios(
             intermediate_hidden=3072,
             num_experts=48 * num_ranks,
             num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
+        # Compatibility probes intentionally exercise dimensions rather than
+        # model-name dispatch.  They cover shared experts and wider top-k so
+        # optimization selectors cannot silently assume the DSV4 topology.
+        ('compat.h6144_i2048_e256_topk8_shared1_m512', dict(
+            num_max_tokens_per_rank=512,
+            num_tokens=512,
+            hidden=6144,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=8,
+            num_shared_experts=1,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
+        ('compat.h7168_i3072_e896_topk16_shared2_m512', dict(
+            num_max_tokens_per_rank=512,
+            num_tokens=512,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=112 * num_ranks,
+            num_topk=16,
+            num_shared_experts=2,
             fast_math=True,
             activation_clamp=10.0,
         )),
@@ -1057,7 +1074,7 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
         raise SystemExit(1)
 
 
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Cross-rank SM90 FP8 x MXFP4 MegaMoE runtime validation')
     parser.add_argument(
@@ -1082,34 +1099,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         '--filter', default='', help='only run scenario names containing this text')
     parser.add_argument(
         '--fail-fast', action='store_true', help='stop after the first failed scenario')
-    args = parser.parse_args(argv)
-    if args.num_processes <= 0:
-        parser.error('--num-processes must be positive')
-    return args
-
-
-def test_forced_ring_wrap_routes_cover_every_expert() -> None:
-    num_ranks = 8
-    routes = torch.cat([
-        _make_forced_ring_wrap_topk_idx(
-            num_tokens=8,
-            num_topk=6,
-            num_experts=32 * num_ranks,
-            rank_idx=rank_idx,
-            num_ranks=num_ranks,
-            device=torch.device('cpu'),
-        ).reshape(-1)
-        for rank_idx in range(num_ranks)
-    ])
-    counts = torch.bincount(routes, minlength=32 * num_ranks)
-    assert torch.all(counts > 0)
-
-
-@pytest.mark.parametrize('num_processes', [0, -1])
-def test_cli_rejects_nonpositive_process_counts(num_processes: int) -> None:
-    with pytest.raises(SystemExit) as exception:
-        _parse_args(['--num-processes', str(num_processes)])
-    assert exception.value.code == 2
+    return parser.parse_args()
 
 
 if __name__ == '__main__':

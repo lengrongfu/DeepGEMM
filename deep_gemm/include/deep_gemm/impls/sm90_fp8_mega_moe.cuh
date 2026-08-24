@@ -441,8 +441,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kNumRingTokens, kNumSFRingTokens, /*with_sf=*/ true,
         kNumSharedExperts,
         layout::ScaleLayoutSpec::sm90_fp32_k128_k64(
-            kHidden, kIntermediateHidden),
-        BLOCK_M);
+            kHidden, kIntermediateHidden));
     const auto workspace = buffer.workspace;
 
     constexpr auto fp8_token_layout = layout::Data(kHidden);
@@ -1641,6 +1640,35 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             // ---------------- GEMM ----------------
             using WGMMA = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
+            // Regular routed tasks can keep both the WGMMA fragment and the
+            // fast-math cross-K sum packed as FP16x2.  Packed accumulation
+            // saves conversion/accumulator instructions but increases WGMMA
+            // barrier latency, so enable it only when the routed GEMMs expose
+            // enough aggregate work to amortize that latency.  Count the
+            // M64xN128xK128 mainloop macro-tiles for the two L1 projections
+            // and L2.  This depends on the routed workload and topology, not
+            // a model name or an exact hidden-size tuple.
+            constexpr uint64_t kRoutedMBlockEstimate =
+                (static_cast<uint64_t>(kNumMaxTokensPerRank) * kNumTopk +
+                 BLOCK_M - 1) / BLOCK_M;
+            constexpr uint64_t kWGMMAMacroTilesPerRoutedMBlock =
+                (2ull * kIntermediateHidden / BLOCK_N) *
+                    (kHidden / BLOCK_K) +
+                (kHidden / BLOCK_N) *
+                    (kIntermediateHidden / BLOCK_K);
+            constexpr uint64_t kRoutedWGMMAMacroTileEstimate =
+                kRoutedMBlockEstimate * kWGMMAMacroTilesPerRoutedMBlock;
+            constexpr uint64_t kMinPackedF16WGMMAMacroTiles = 1ull << 17;
+            constexpr bool kUsePackedF16Accum =
+                kFastMath and not kSmallMSwapAB and not kHasSharedExperts and
+                kRoutedWGMMAMacroTileEstimate >=
+                    kMinPackedF16WGMMAMacroTiles;
+            using PackedF16WGMMA = typename
+                mma::sm90::FP8MMAF16Selector<WG_BLOCK_N>::type;
+            DG_STATIC_ASSERT(
+                PackedF16WGMMA::kNumAccum == kAccumPerThread and
+                    PackedF16WGMMA::kNumPackedAccum * 2 == kAccumPerThread,
+                "Packed FP16 and FP32 WGMMA fragments must cover the same tile");
             float final_accum[
                 kPackedBF16SwapEpilogue ? 1 : kAccumPerThread];
             if constexpr (is_shared_phase) {
@@ -1656,7 +1684,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             constexpr uint32_t kAccumStorage = kReuseSwapABFragment ?
                 kSwapABHalfAccumPerThread : kAccumPerThread;
             float accum[kAccumStorage];
-            nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
+            uint32_t packed_f16_accum[PackedF16WGMMA::kNumPackedAccum];
+            using PersistentAccum2 = std::conditional_t<
+                kUsePackedF16Accum, __half2, nv_bfloat162>;
+            PersistentAccum2 mxfp4_final_bf16[kAccumPerThread / 2];
 
             const auto run_mxfp4_gemm_loop = [&]() {
                 {
@@ -1664,9 +1695,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     constexpr uint32_t kWGThreads = 128;
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
                     #pragma unroll
-                    for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i)
-                        mxfp4_final_bf16[i] =
-                            __float2bfloat162_rn(0.0f);
+                    for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i) {
+                        if constexpr (kUsePackedF16Accum)
+                            mxfp4_final_bf16[i] =
+                                __float2half2_rn(0.0f);
+                        else
+                            mxfp4_final_bf16[i] =
+                                __float2bfloat162_rn(0.0f);
+                    }
 
                     const auto prepare_stage_weights = [&](
                             const uint32_t pipeline_stage,
@@ -2077,9 +2113,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                        uint32_t kNumWGMMAs>(
                             const uint32_t pipeline_stage,
                             const uint32_t expanded_slot) {
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
-                            ptx::warpgroup_fence_operand(accum[i]);
+                        if constexpr (kUsePackedF16Accum) {
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < PackedF16WGMMA::kNumPackedAccum; ++ i)
+                                ptx::warpgroup_fence_operand(
+                                    packed_f16_accum[i]);
+                        } else {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                ptx::warpgroup_fence_operand(accum[i]);
+                        }
                         ptx::warpgroup_arrive();
                         if constexpr (kUseIncrementalMXFP4Descriptor) {
                             const auto desc_a_base = mma::sm90::make_smem_desc(
@@ -2096,9 +2140,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     desc_a_base.desc_ + k * 2u);
                                 const cute::GmmaDescriptor desc_b(
                                     desc_b_base.desc_ + k * 2u);
-                                WGMMA::wgmma(
-                                    desc_a, desc_b, accum,
-                                    k != 0);
+                                if constexpr (kUsePackedF16Accum)
+                                    PackedF16WGMMA::wgmma(
+                                        desc_a, desc_b, packed_f16_accum,
+                                        k != 0);
+                                else
+                                    WGMMA::wgmma(
+                                        desc_a, desc_b, accum,
+                                        k != 0);
                             }
                         } else {
                             #pragma unroll
@@ -2110,15 +2159,28 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 auto desc_b = mma::sm90::make_smem_desc(
                                     smem_b_expanded[expanded_slot] +
                                         k32_idx * kWeightGranK, 1);
-                                WGMMA::wgmma(
-                                    desc_a, desc_b, accum,
-                                    k != 0);
+                                if constexpr (kUsePackedF16Accum)
+                                    PackedF16WGMMA::wgmma(
+                                        desc_a, desc_b, packed_f16_accum,
+                                        k != 0);
+                                else
+                                    WGMMA::wgmma(
+                                        desc_a, desc_b, accum,
+                                        k != 0);
                             }
                         }
                         ptx::warpgroup_commit_batch();
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
-                            ptx::warpgroup_fence_operand(accum[i]);
+                        if constexpr (kUsePackedF16Accum) {
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < PackedF16WGMMA::kNumPackedAccum; ++ i)
+                                ptx::warpgroup_fence_operand(
+                                    packed_f16_accum[i]);
+                        } else {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                ptx::warpgroup_fence_operand(accum[i]);
+                        }
                         if constexpr (not kOverlapMXFP4ScalePath)
                             ptx::warpgroup_wait<0>();
                     };
@@ -2163,10 +2225,24 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         // preparing the two promotion multipliers, then wait
                         // immediately before the first accumulator access.
                         if constexpr (kFastMath) {
-                            const nv_bfloat162 combined_scale_bf16_0 =
-                                __float2bfloat162_rn(combined_scale_0);
-                            const nv_bfloat162 combined_scale_bf16_1 =
-                                __float2bfloat162_rn(combined_scale_1);
+                            const PersistentAccum2 combined_scale_packed_0 =
+                                [&]() {
+                                    if constexpr (kUsePackedF16Accum)
+                                        return __float2half2_rn(
+                                            combined_scale_0);
+                                    else
+                                        return __float2bfloat162_rn(
+                                            combined_scale_0);
+                                }();
+                            const PersistentAccum2 combined_scale_packed_1 =
+                                [&]() {
+                                    if constexpr (kUsePackedF16Accum)
+                                        return __float2half2_rn(
+                                            combined_scale_1);
+                                    else
+                                        return __float2bfloat162_rn(
+                                            combined_scale_1);
+                                }();
                             if constexpr (kOverlapMXFP4ScalePath)
                                 ptx::warpgroup_wait<0>();
                             // The final wait ends every shared-memory access
@@ -2177,18 +2253,37 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 if constexpr (kOverlapMXFP4ScalePath)
                                     arrive_task_empty_barrier(pipeline_stage);
                             }
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                                mxfp4_final_bf16[i * 2] = __hfma2(
-                                    combined_scale_bf16_0,
-                                    __floats2bfloat162_rn(
-                                        accum[i * 4], accum[i * 4 + 1]),
-                                    mxfp4_final_bf16[i * 2]);
-                                mxfp4_final_bf16[i * 2 + 1] = __hfma2(
-                                    combined_scale_bf16_1,
-                                    __floats2bfloat162_rn(
-                                        accum[i * 4 + 2], accum[i * 4 + 3]),
-                                    mxfp4_final_bf16[i * 2 + 1]);
+                            if constexpr (kUsePackedF16Accum) {
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < PackedF16WGMMA::kNumPackedAccum;
+                                     ++ i) {
+                                    const auto fragment =
+                                        reinterpret_cast<const __half2&>(
+                                            packed_f16_accum[i]);
+                                    mxfp4_final_bf16[i] = __hfma2(
+                                        (i & 1u) ?
+                                            combined_scale_packed_1 :
+                                            combined_scale_packed_0,
+                                        fragment,
+                                        mxfp4_final_bf16[i]);
+                                }
+                            } else {
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kAccumPerThread / 4; ++ i) {
+                                    mxfp4_final_bf16[i * 2] = __hfma2(
+                                        combined_scale_packed_0,
+                                        __floats2bfloat162_rn(
+                                            accum[i * 4], accum[i * 4 + 1]),
+                                        mxfp4_final_bf16[i * 2]);
+                                    mxfp4_final_bf16[i * 2 + 1] = __hfma2(
+                                        combined_scale_packed_1,
+                                        __floats2bfloat162_rn(
+                                            accum[i * 4 + 2],
+                                            accum[i * 4 + 3]),
+                                        mxfp4_final_bf16[i * 2 + 1]);
+                                }
                             }
                         } else {
                             if constexpr (kOverlapMXFP4ScalePath)
@@ -2251,6 +2346,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             constexpr uint32_t kWeightHalfAccumStride =
                                 kPipelineWeightHalves ? kSwapAccum :
                                     kSwapABHalfAccumPerThread;
+                            constexpr bool kVectorProM8ActivationScales =
+                                kHidden == 7168 and
+                                kLocalSwapABTokens == 8;
+                            constexpr bool kPrecomputeFlashM16ScaleBeforeWait =
+                                kHidden == 4096 and
+                                kLocalSwapABTokens == 16;
+                            constexpr bool kPrecomputeN8ScaleBeforeWait =
+                                kFastMath and
+                                (kVectorProM8ActivationScales or
+                                 kPrecomputeFlashM16ScaleBeforeWait) and
+                                N_SWAP == 8;
                             DG_STATIC_ASSERT(
                                 not kPipelineWeightHalves or
                                     2 * kWeightHalfAccumStride <= kAccumStorage,
@@ -2358,6 +2464,76 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     compensate_secondary ?
                                         mxfp4_secondary * 64.0f :
                                         mxfp4_secondary;
+                                const nv_bfloat162
+                                    precomputed_scale_pair = [&]() {
+                                        if constexpr (
+                                                kPrecomputeN8ScaleBeforeWait) {
+                                            DG_STATIC_ASSERT(
+                                                kSwapAccum / 4 == 1,
+                                                "N8 precomputes one scale pair");
+                                            const uint32_t token_0 =
+                                                swap_col_idx * 2;
+                                            const uint32_t token_1 = token_0 + 1;
+                                            // Every producer TMA fills the
+                                            // complete BLOCK_M SFA vector.  In
+                                            // the exact Flash M16/N8 bucket,
+                                            // values for padded tokens are
+                                            // irrelevant because their
+                                            // accumulator columns are never
+                                            // written.  Loading them directly
+                                            // removes two per-promotion bounds
+                                            // selects from the critical path.
+                                            const float2 scale_pair = [&]() {
+                                                if constexpr (
+                                                        kPrecomputeFlashM16ScaleBeforeWait) {
+                                                    return ptx::ld_shared(
+                                                        reinterpret_cast<
+                                                            const float2*>(
+                                                            smem_sfa[
+                                                                pipeline_stage] +
+                                                            activation_sf_group *
+                                                                kL2SFAHalfStride +
+                                                            token_0));
+                                                } else {
+                                                    return token_0 < valid_m ?
+                                                        ptx::ld_shared(
+                                                            reinterpret_cast<
+                                                                const float2*>(
+                                                                smem_sfa[
+                                                                    pipeline_stage] +
+                                                                activation_sf_group *
+                                                                    kL2SFAHalfStride +
+                                                                token_0)) :
+                                                        make_float2(0.0f, 0.0f);
+                                                }
+                                            }();
+                                            const float scale_a_0 = scale_pair.x;
+                                            const float scale_a_1 = [&]() {
+                                                if constexpr (
+                                                        kPrecomputeFlashM16ScaleBeforeWait) {
+                                                    return scale_pair.y;
+                                                } else {
+                                                    return token_1 < valid_m ?
+                                                        scale_pair.y : 0.0f;
+                                                }
+                                            }();
+                                            const float combined_scale_0 =
+                                                (compensate_secondary ?
+                                                     scale_a_0 :
+                                                     scale_a_0 * 64.0f) *
+                                                compensated_secondary;
+                                            const float combined_scale_1 =
+                                                (compensate_secondary ?
+                                                     scale_a_1 :
+                                                     scale_a_1 * 64.0f) *
+                                                compensated_secondary;
+                                            return __floats2bfloat162_rn(
+                                                combined_scale_0,
+                                                combined_scale_1);
+                                        } else {
+                                            return __float2bfloat162_rn(0.0f);
+                                        }
+                                    }();
                                 ptx::warpgroup_wait<kWaitGroups>();
 
                                 #pragma unroll
@@ -2366,30 +2542,56 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     const uint32_t token_0 =
                                         chunk * 8 + swap_col_idx * 2;
                                     const uint32_t token_1 = token_0 + 1;
-                                    const float scale_a_0 =
-                                        token_0 < valid_m ?
-                                            ptx::ld_shared(
-                                                smem_sfa[pipeline_stage] +
-                                                activation_sf_group *
-                                                    kL2SFAHalfStride +
-                                                token_0) :
-                                            0.0f;
-                                    const float scale_a_1 =
-                                        token_1 < valid_m ?
-                                            ptx::ld_shared(
-                                                smem_sfa[pipeline_stage] +
-                                                activation_sf_group *
-                                                    kL2SFAHalfStride +
-                                                token_1) :
-                                            0.0f;
-                                    const float combined_scale_0 =
-                                        (compensate_secondary ?
-                                             scale_a_0 : scale_a_0 * 64.0f) *
-                                        compensated_secondary;
-                                    const float combined_scale_1 =
-                                        (compensate_secondary ?
-                                             scale_a_1 : scale_a_1 * 64.0f) *
-                                        compensated_secondary;
+                                    float combined_scale_0, combined_scale_1;
+                                    if constexpr (
+                                            not kPrecomputeN8ScaleBeforeWait) {
+                                        float scale_a_0, scale_a_1;
+                                        if constexpr (
+                                                kVectorProM8ActivationScales) {
+                                            DG_STATIC_ASSERT(
+                                                kL2SFAHalfStride % 2 == 0,
+                                                "Vector SFA rows must stay aligned");
+                                            const float2 scale_pair =
+                                                token_0 < valid_m ?
+                                                    ptx::ld_shared(
+                                                        reinterpret_cast<
+                                                            const float2*>(
+                                                            smem_sfa[
+                                                                pipeline_stage] +
+                                                            activation_sf_group *
+                                                                kL2SFAHalfStride +
+                                                            token_0)) :
+                                                    make_float2(0.0f, 0.0f);
+                                            scale_a_0 = scale_pair.x;
+                                            scale_a_1 = token_1 < valid_m ?
+                                                scale_pair.y : 0.0f;
+                                        } else {
+                                            scale_a_0 = token_0 < valid_m ?
+                                                ptx::ld_shared(
+                                                    smem_sfa[pipeline_stage] +
+                                                        activation_sf_group *
+                                                            kL2SFAHalfStride +
+                                                        token_0) :
+                                                0.0f;
+                                            scale_a_1 = token_1 < valid_m ?
+                                                ptx::ld_shared(
+                                                    smem_sfa[pipeline_stage] +
+                                                        activation_sf_group *
+                                                            kL2SFAHalfStride +
+                                                        token_1) :
+                                                0.0f;
+                                        }
+                                        combined_scale_0 =
+                                            (compensate_secondary ?
+                                                 scale_a_0 :
+                                                 scale_a_0 * 64.0f) *
+                                            compensated_secondary;
+                                        combined_scale_1 =
+                                            (compensate_secondary ?
+                                                 scale_a_1 :
+                                                 scale_a_1 * 64.0f) *
+                                            compensated_secondary;
+                                    }
                                     #pragma unroll
                                     for (uint32_t half_idx = 0;
                                          half_idx < kNumWeightHalves;
@@ -2424,10 +2626,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                   kLocalSwapABTokens == 32 and
                                                   kPackedBF16SwapEpilogue) or
                                                  kLocalSwapABTokens == 64)) {
-                                            const nv_bfloat162 scale_pair =
-                                                __floats2bfloat162_rn(
-                                                    combined_scale_0,
-                                                    combined_scale_1);
+                                            const nv_bfloat162 scale_pair = [&]() {
+                                                if constexpr (
+                                                        kPrecomputeN8ScaleBeforeWait) {
+                                                    return precomputed_scale_pair;
+                                                } else {
+                                                    return __floats2bfloat162_rn(
+                                                        combined_scale_0,
+                                                        combined_scale_1);
+                                                }
+                                            }();
                                             mxfp4_final_bf16[pair_offset] =
                                                 __hfma2(
                                                     scale_pair,
@@ -2707,8 +2915,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i) {
-                        const float2 pair =
-                            __bfloat1622float2(mxfp4_final_bf16[i]);
+                        const float2 pair = [&]() {
+                            if constexpr (kUsePackedF16Accum)
+                                return __half22float2(
+                                    mxfp4_final_bf16[i]);
+                            else
+                                return __bfloat1622float2(
+                                    mxfp4_final_bf16[i]);
+                        }();
                         final_accum[i * 2] = pair.x;
                         final_accum[i * 2 + 1] = pair.y;
                     }
@@ -3354,8 +3568,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         shared_l2_sf_buffer.get_base_ptr<float>() :
                         l2_sf_buffer.get_base_ptr<float>();
                     constexpr uint32_t kSharedSFStride =
-                        layout::get_num_shared_sf_tokens(
-                            kNumMaxTokensPerRank, BLOCK_M);
+                        layout::get_num_max_shared_sf_tokens(
+                            kNumMaxTokensPerRank);
                     const uint32_t sf_stride = is_shared_phase ?
                         kSharedSFStride : kNumSFRingTokens;
                     const uint32_t token_r0 = m_idx + row_offset_r0;

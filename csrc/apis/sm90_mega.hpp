@@ -75,7 +75,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const std::string& mma_type, const std::string& activation,
+    const bool& use_fp8_dispatch, const std::string& activation,
     const int& num_shared_experts = 0) {
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
     DG_HOST_ASSERT(num_ranks > 0 and num_ranks <= kSM90MegaMoEMaxRanks);
@@ -91,12 +91,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
     // TMA alignment. L2 K64 FP32 SF rows occupy I/16 bytes.
     DG_HOST_ASSERT(is_valid_hidden_for_sm90_mega_moe(hidden) and
                    intermediate_hidden % 256 == 0);
-    // Keep the buffer API weight-format aware even though only MXFP4 is
-    // implemented today. Future FP8 and INT4 backends can select their layout
-    // here without introducing another public allocator.
-    DG_HOST_ASSERT(mma_type == "fp8xmxfp4");
+    DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
-
     const auto num_ring_tokens = get_num_ring_tokens_for_sm90_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden);
@@ -108,12 +104,10 @@ get_symm_buffer_size_for_sm90_mega_moe(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens,
-        /*with_sf=*/ true, num_shared_experts, scale_layout_spec,
-        kSM90MegaMoEBlockM);
+        /*with_sf=*/ true, num_shared_experts, scale_layout_spec);
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
     const auto num_max_shared_sf_tokens =
-        layout::get_num_shared_sf_tokens(
-            num_max_tokens_per_rank, kSM90MegaMoEBlockM);
+        layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank);
 
     // Slice function follows main's twelve-view ABI.  Shared weights remain
     // FP8+FP32 on SM90; only routed weights use packed MXFP4+UE8M0.
@@ -185,7 +179,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
 // K32 relative UE8M0 scales plus one FP32 secondary scale per expert.
 // Top-level routing is the caller's responsibility (see
 // `deep_gemm/mega/__init__.py`).
-static void run_sm90_fp8_mxfp4_mega_moe(
+static void sm90_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>& l2_weights_tuple,
@@ -364,7 +358,7 @@ static void run_sm90_fp8_mxfp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "fp8xmxfp4", activation, num_shared_experts);
+        true, activation, num_shared_experts);
     // The live-ring offsets depend on H/I/S and the active worker-SM count.
     // Require the exact allocation contract so a buffer created for another
     // shape, shared-expert count, or `set_num_sms` value cannot be re-sliced
@@ -415,7 +409,7 @@ static void fp8_mxfp4_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math) {
-    run_sm90_fp8_mxfp4_mega_moe(
+    sm90_mega_moe(
         y, l1_weights_tuple, l2_weights_tuple,
         shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
         cumulative_local_expert_recv_stats,

@@ -322,7 +322,7 @@ def _benchmark_case(
             buffer.x_sf[:num_tokens].copy_(x_scale)
             buffer.topk_idx[:num_tokens].copy_(topk_idx)
             buffer.topk_weights[:num_tokens].copy_(topk_weights)
-            deep_gemm.fp8_mega_moe(
+            deep_gemm.fp8_mxfp4_mega_moe(
                 output,
                 transformed_l1,
                 transformed_l2,

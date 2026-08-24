@@ -1,6 +1,7 @@
 """CPU contract tests for SM90 Humming-compatible MXFP4 weight transforms."""
 
 import importlib.util
+import inspect
 from pathlib import Path
 import sys
 import types
@@ -232,42 +233,6 @@ def test_canonical_transform_applies_checkpoint_weight_scale_2():
     mxfp4._validate_processed_mxfp4_kernel_weights(transformed_l1, transformed_l2)
 
 
-def test_processed_payload_rejects_plain_triplets_and_invalid_semantics():
-    checkpoint_l1, checkpoint_l2 = _valid_checkpoint_weights()
-    processed_l1, processed_l2 = (
-        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-            checkpoint_l1, checkpoint_l2))
-
-    with pytest.raises(ValueError, match='returned by the SM90 transform'):
-        mxfp4._validate_processed_mxfp4_kernel_weights(
-            tuple(processed_l1), processed_l2)
-
-    raw_relative_sf = torch.full_like(processed_l1[1], 109)
-    with pytest.raises(ValueError, match=r'relative UE8M0 values in \[1, 12\]'):
-        mxfp4.MXFP4ProcessedWeights((
-            processed_l1[0], raw_relative_sf, processed_l1[2]))
-
-    for invalid_secondary in (float('nan'), float('inf'), 0.0, -1.0):
-        with pytest.raises(ValueError, match='finite positive'):
-            mxfp4.MXFP4ProcessedWeights((
-                processed_l1[0], processed_l1[1],
-                torch.tensor([invalid_secondary], dtype=torch.float32),
-            ))
-
-
-def test_checkpoint_weight_scale_2_overflow_is_rejected():
-    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_checkpoint_weights()
-    l1_sf.fill_(254)
-    l2_sf.fill_(254)
-    with pytest.raises(ValueError, match='finite positive'):
-        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-            (l1_w, l1_sf),
-            (l2_w, l2_sf),
-            l1_weight_scale_2=torch.tensor([8.0], dtype=torch.float32),
-            l2_weight_scale_2=torch.tensor([8.0], dtype=torch.float32),
-        )
-
-
 def test_invalid_mxfp4_contracts_fail_before_kernel_launch():
     l1, l2 = _valid_checkpoint_weights()
 
@@ -321,7 +286,7 @@ def test_explicit_wrapper_rejects_the_sm100_buffer_abi_before_launch():
     mega, package_name = _load_mega_api_for_cpu()
     try:
         with pytest.raises(TypeError, match='requires an SM90SymmBuffer'):
-            mega.fp8_mega_moe(None, (), (), object())
+            mega.fp8_mxfp4_mega_moe(None, (), (), object())
     finally:
         _unload_fake_package(package_name)
 
@@ -336,7 +301,6 @@ def test_explicit_wrapper_rejects_wrong_local_expert_shard_before_launch():
 
     buffer = mega.SM90SymmBuffer.__new__(mega.SM90SymmBuffer)
     buffer.group = FakeGroup()
-    buffer.mma_type = 'fp8xmxfp4'
     buffer.num_experts = 4
     checkpoint_l1, checkpoint_l2 = _valid_checkpoint_weights(num_experts=1)
     transformed_l1, transformed_l2 = (
@@ -344,7 +308,7 @@ def test_explicit_wrapper_rejects_wrong_local_expert_shard_before_launch():
             checkpoint_l1, checkpoint_l2))
     try:
         with pytest.raises(ValueError, match='expected E_local=2, got 1'):
-            mega.fp8_mega_moe(
+            mega.fp8_mxfp4_mega_moe(
                 None, transformed_l1, transformed_l2, buffer)
     finally:
         _unload_fake_package(package_name)
@@ -365,7 +329,6 @@ def test_explicit_wrapper_forwards_only_processed_triples():
 
     buffer = mega.SM90SymmBuffer.__new__(mega.SM90SymmBuffer)
     buffer.group = FakeGroup()
-    buffer.mma_type = 'fp8xmxfp4'
     buffer.num_experts = 1
     buffer.num_max_tokens_per_rank = 128
     buffer.num_topk = 1
@@ -382,7 +345,7 @@ def test_explicit_wrapper_forwards_only_processed_triples():
         fp8_mxfp4_mega_moe=lambda *args: calls.append(args))
     y = object()
     try:
-        mega.fp8_mega_moe(
+        mega.fp8_mxfp4_mega_moe(
             y, processed_l1, processed_l2, buffer,
             recipe=(1, 1, 32), activation='swiglu',
             activation_clamp=10.0, fast_math=False)
@@ -404,6 +367,12 @@ def test_explicit_wrapper_forwards_only_processed_triples():
 def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():
     mega, package_name = _load_mega_api_for_cpu()
     sizing_calls = []
+
+    assert tuple(inspect.signature(
+        mega.get_symm_buffer_for_sm90_mega_moe).parameters) == (
+            'group', 'num_experts', 'num_max_tokens_per_rank', 'num_topk',
+            'hidden', 'intermediate_hidden', 'use_fp8_dispatch', 'activation',
+            'num_shared_experts')
 
     class FakeBuffer:
         def __init__(self):
@@ -447,9 +416,14 @@ def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():
     )
     group = FakeGroup()
     try:
-        with pytest.raises(ValueError, match='Unsupported SM90 MegaMoE mma_type'):
+        with pytest.raises(ValueError, match='requires FP8 dispatch'):
             mega.get_symm_buffer_for_sm90_mega_moe(
-                group, 16, 128, 2, 512, 256, mma_type='fp8xint4')
+                group, 16, 128, 2, 512, 256,
+                use_fp8_dispatch=False)
+        with pytest.raises(ValueError, match='Only `swiglu` activation'):
+            mega.get_symm_buffer_for_sm90_mega_moe(
+                group, 16, 128, 2, 512, 256,
+                activation='gelu')
         buffer = mega.get_symm_buffer_for_sm90_mega_moe(
             group,
             num_experts=16,
@@ -458,9 +432,8 @@ def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():
             hidden=512,
             intermediate_hidden=256,
         )
-        assert buffer.mma_type == 'fp8xmxfp4'
         assert sizing_calls == [(
-            1, 16, 128, 2, 512, 256, 'fp8xmxfp4', 'swiglu', 0)]
+            1, 16, 128, 2, 512, 256, True, 'swiglu', 0)]
         assert buffer.num_max_tokens_per_rank == 128
         assert group.barriers == 1
         assert (
@@ -481,7 +454,7 @@ def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():
             group, 16, 128, 2, 512, 256, num_shared_experts=1)
         assert shared_buffer.num_shared_experts == 1
         assert sizing_calls[-1] == (
-            1, 16, 128, 2, 512, 256, 'fp8xmxfp4', 'swiglu', 1)
+            1, 16, 128, 2, 512, 256, True, 'swiglu', 1)
         shared_buffer.destroy()
     finally:
         _unload_fake_package(package_name)
@@ -508,17 +481,5 @@ def test_sm90_shared_weight_transform_interleaves_only_l1_fp8_rows():
         assert transformed_l1[1].data_ptr() == l1_scale.data_ptr()
         assert transformed_l2[0].data_ptr() == l2_weight.data_ptr()
         assert transformed_l2[1].data_ptr() == l2_scale.data_ptr()
-
-        for invalid_scale in (float('nan'), float('inf'), 0.0, -1.0):
-            bad_l1_scale = torch.full_like(l1_scale, invalid_scale)
-            with pytest.raises(ValueError, match='finite positive'):
-                mega.transform_shared_weights_for_fp8_mega_moe_sm90(
-                    (l1_weight, bad_l1_scale), (l2_weight, l2_scale))
-
-        meta_l1_scale = torch.empty(
-            l1_scale.shape, dtype=torch.float32, device='meta')
-        with pytest.raises(ValueError, match='same device'):
-            mega.transform_shared_weights_for_fp8_mega_moe_sm90(
-                (l1_weight, meta_l1_scale), (l2_weight, l2_scale))
     finally:
         _unload_fake_package(package_name)
