@@ -5,12 +5,12 @@ Ported from upstream PR https://github.com/sgl-project/DeepGEMM/pull/36
 test harness (`init_dist`/`dist_print`, multiprocessing-spawn driver) of `tests/test_mega_moe.py`
 (the SM100 FP4 MegaMoE test in this repo), and to call the SM90 API surface added in
 `deep_gemm.mega` (`Sm90SymmBuffer`, `get_symm_buffer_for_sm90_mega_moe`,
-`transform_weights_for_mega_moe_sm90`, `fp8_mega_moe_sm90`).
+`transform_weights_for_mega_moe_sm90`, `fp8_mega_moe_sm90`). The interleaved scheduler and fused
+shared-expert support were ported from the follow-up PR https://github.com/sgl-project/DeepGEMM/pull/69.
 
 Unlike the SM100 path, `fp8_mega_moe_sm90`:
   * is FP8xFP8-only (no FP4 weights, no `bf16xbf16` variant here);
   * uses plain float scale factors at block-(128, 128)/(token, 128) granularity (no UE8M0 packing);
-  * has no shared-expert support;
   * runs on a simpler pool-based scheduler (no ring buffer).
 
 This test is skipped cleanly (prints a message and returns) on any non-Hopper (SM90) GPU.
@@ -40,12 +40,27 @@ def _quantize_weights_block_128_128(bf16_weights: torch.Tensor) -> Tuple[torch.T
     return w, w_sf
 
 
+def _dense_swiglu_mlp(
+    x_f32: torch.Tensor, l1_f32: torch.Tensor, l2_f32: torch.Tensor, activation_clamp: float,
+) -> torch.Tensor:
+    """Naive dense SwiGLU MLP in FP32: `x @ l1.T -> SwiGLU -> @ l2.T`, no routing/weighting."""
+    gate_up = x_f32 @ l1_f32.T
+    intermediate_hidden = gate_up.shape[-1] // 2
+    gate, up = gate_up[..., :intermediate_hidden], gate_up[..., intermediate_hidden:]
+    gate = gate.clamp(max=activation_clamp)
+    up = up.clamp(min=-activation_clamp, max=activation_clamp)
+    act = torch.nn.functional.silu(gate) * up
+    return act @ l2_f32.T
+
+
 def _reference_mega_moe(
     x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
     l1_weights: torch.Tensor, l2_weights: torch.Tensor,
     num_experts_per_rank: int, activation_clamp: float,
+    shared_l1_weights: torch.Tensor = None, shared_l2_weights: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Naive reference: dense routed SwiGLU MLP in FP32, evaluated per (token, topk) pair.
+    """Naive reference: dense routed SwiGLU MLP in FP32, evaluated per (token, topk) pair, plus
+    (if given) the fused shared expert's dense SwiGLU MLP applied to every token with weight 1.
     NOTES: this assumes a single rank (EP=1), matching how this test invokes the kernel."""
     num_tokens, hidden = x.shape
     num_topk = topk_idx.shape[1]
@@ -59,14 +74,10 @@ def _reference_mega_moe(
             if e < 0 or e >= num_experts_per_rank:
                 continue
             w = topk_weights[t, k].item()
-            gate_up = x_f32[t] @ l1_f32[e].T
-            intermediate_hidden = gate_up.shape[0] // 2
-            gate, up = gate_up[:intermediate_hidden], gate_up[intermediate_hidden:]
-            gate = gate.clamp(max=activation_clamp)
-            up = up.clamp(min=-activation_clamp, max=activation_clamp)
-            act = torch.nn.functional.silu(gate) * up
-            out = act @ l2_f32[e].T
+            out = _dense_swiglu_mlp(x_f32[t], l1_f32[e], l2_f32[e], activation_clamp)
             y[t] += w * out
+    if shared_l1_weights is not None:
+        y += _dense_swiglu_mlp(x_f32, shared_l1_weights.float(), shared_l2_weights.float(), activation_clamp)
     return y.to(torch.bfloat16)
 
 
@@ -89,6 +100,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_experts_per_rank = num_experts // num_ranks
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     activation_clamp = args.activation_clamp
+    num_shared_experts = args.num_shared_experts
     assert num_tokens <= num_max_tokens_per_rank
 
     # Allocate the SM90 symmetric buffer
@@ -96,6 +108,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
+        num_shared_experts,
     )
 
     # Random inputs
@@ -117,6 +130,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         (l1_weights_fp8, l1_weights_sf), (l2_weights_fp8, l2_weights_sf))
 
+    # Fused shared expert: a single dense MLP (no expert dimension), quantized/transformed the
+    # same way as one routed expert's weights (the transform helper only needs a 2D tensor).
+    shared_l1_weights_bf16, shared_l2_weights_bf16 = None, None
+    transformed_shared_l1, transformed_shared_l2 = None, None
+    if num_shared_experts > 0:
+        shared_intermediate_hidden = intermediate_hidden * num_shared_experts
+        shared_l1_weights_bf16 = torch.randn(
+            (shared_intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
+        shared_l2_weights_bf16 = torch.randn(
+            (hidden, shared_intermediate_hidden), dtype=torch.bfloat16, device='cuda')
+        shared_l1_weights_fp8, shared_l1_weights_sf = _quantize_weights_block_128_128(
+            shared_l1_weights_bf16.unsqueeze(0))
+        shared_l2_weights_fp8, shared_l2_weights_sf = _quantize_weights_block_128_128(
+            shared_l2_weights_bf16.unsqueeze(0))
+        transformed_shared_l1, transformed_shared_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+            (shared_l1_weights_fp8.squeeze(0), shared_l1_weights_sf.squeeze(0)),
+            (shared_l2_weights_fp8.squeeze(0), shared_l2_weights_sf.squeeze(0)))
+
     # Copy inputs into the symmetric buffer
     buffer.x[:num_tokens].copy_(x_fp8)
     buffer.x_sf[:num_tokens].copy_(x_sf)
@@ -130,6 +161,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     deep_gemm.fp8_mega_moe_sm90(
         y, transformed_l1, transformed_l2, buffer,
+        shared_l1_weights=transformed_shared_l1, shared_l2_weights=transformed_shared_l2,
         activation_clamp=activation_clamp,
     )
 
@@ -137,15 +169,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         y_ref = _reference_mega_moe(
             x, local_topk_idx, topk_weights,
             l1_weights_bf16, l2_weights_bf16,
-            num_experts_per_rank, activation_clamp)
+            num_experts_per_rank, activation_clamp,
+            shared_l1_weights_bf16, shared_l2_weights_bf16)
         diff = calc_diff(y.float(), y_ref.float())
-        dist_print(f' > EP {rank_idx:2}/{num_ranks} | correctness diff: {diff:.6f}', once_in_node=True)
+        dist_print(f' > EP {rank_idx:2}/{num_ranks} | num_shared_experts={num_shared_experts} | '
+                   f'correctness diff: {diff:.6f}', once_in_node=True)
         assert diff < 0.05, f'MegaMoE SM90 correctness check failed: diff={diff}'
     else:
         # Cross-rank combine correctness needs a distributed reference; only run the smoke check
         # (kernel executes without error / NaNs) for multi-rank configurations.
         assert torch.isfinite(y.float()).all(), 'MegaMoE SM90 produced non-finite outputs'
-        dist_print(f' > EP {rank_idx:2}/{num_ranks} | smoke test passed (finite outputs)', once_in_node=True)
+        dist_print(f' > EP {rank_idx:2}/{num_ranks} | num_shared_experts={num_shared_experts} | '
+                   f'smoke test passed (finite outputs)', once_in_node=True)
 
     dist.barrier()
     buffer.destroy()
@@ -162,6 +197,7 @@ if __name__ == '__main__':
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
     parser.add_argument('--num-experts', type=int, default=8, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=2, help='Number of expert selections')
+    parser.add_argument('--num-shared-experts', type=int, default=0, help='Number of fused shared experts (0 disables fusion)')
     args = parser.parse_args()
 
     if args.num_processes == 1:

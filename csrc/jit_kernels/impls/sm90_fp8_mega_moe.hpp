@@ -19,8 +19,10 @@ namespace deep_gemm {
 // ============================================================================
 // SM90 (Hopper) FP8 MegaMoE host runtime
 // ----------------------------------------------------------------------------
-// Ported from upstream PR https://github.com/sgl-project/DeepGEMM/pull/36. This is the SM90
-// counterpart of `SM100FP8FP4MegaMoERuntime`. The kernel itself lives in
+// Ported from upstream PR https://github.com/sgl-project/DeepGEMM/pull/36, with the
+// interleaved scheduler and fused shared-expert support ported from the follow-up
+// PR https://github.com/sgl-project/DeepGEMM/pull/69. This is the SM90 counterpart
+// of `SM100FP8FP4MegaMoERuntime`. The kernel itself lives in
 // `deep_gemm/impls/sm90_fp8_mega_moe.cuh`.
 //
 // Differences from the SM100 path:
@@ -30,7 +32,9 @@ namespace deep_gemm {
 //     per-64 K granularity.
 //   * No tensor memory: WGMMA accumulators are register-resident.
 //   * No 2-CTA cluster: `cluster_size` is always 1.
-//   * No shared-expert support (the PR this was ported from does not implement it for SM90).
+//   * The fused shared expert is a single dense MLP over this rank's own tokens (no expert
+//     dimension); its L1 activations are the local `x` region (K-major SF, gathered by the loader
+//     warp -- see the kernel), and its L2 activations/SF live in a small dedicated pool.
 // ============================================================================
 
 class SM90FP8MegaMoERuntime final : public LaunchRuntime<SM90FP8MegaMoERuntime> {
@@ -47,7 +51,7 @@ public:
         bool reuse_accum_as_final;
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
-        bool split_phase_hot_path;
+        int num_shared_experts;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -69,6 +73,18 @@ public:
         CUtensorMap tensor_map_l2_weights;
         const float* l2_weights_sf;
 
+        // Fused shared expert. When `num_shared_experts == 0` these mirror the routed
+        // descriptors: the kernel never reads them. Shared L1 acts SF needs no descriptor (the
+        // loader warp gathers the K-major `x_sf` column itself).
+        CUtensorMap tensor_map_shared_l1_acts;
+        CUtensorMap tensor_map_shared_l1_weights;
+        const float* shared_l1_weights_sf;
+        CUtensorMap tensor_map_shared_l1_output;
+        CUtensorMap tensor_map_shared_l2_acts;
+        CUtensorMap tensor_map_shared_l2_weights;
+        const float* shared_l2_weights_sf;
+        CUtensorMap tensor_map_shared_l2_acts_sf;
+
         // Launch configs
         LaunchArgs launch_args;
     };
@@ -84,7 +100,6 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {},
         {}, {}, {},
         {},
         {},
@@ -104,7 +119,6 @@ static void __instantiate_kernel() {{
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
-    args.config.num_experts_per_wave,
     args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_max_pool_tokens,
     args.config.num_padded_sf_pool_tokens,
@@ -117,7 +131,7 @@ static void __instantiate_kernel() {{
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
-    args.split_phase_hot_path ? "true" : "false");
+    args.num_shared_experts);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -134,7 +148,15 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.tensor_map_shared_l1_acts,
+            args.tensor_map_shared_l1_weights,
+            args.shared_l1_weights_sf,
+            args.tensor_map_shared_l1_output,
+            args.tensor_map_shared_l2_acts,
+            args.tensor_map_shared_l2_weights,
+            args.shared_l2_weights_sf,
+            args.tensor_map_shared_l2_acts_sf
         ));
     }
 };
@@ -145,18 +167,29 @@ static void sm90_fp8_mega_moe(
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
+    // Fused shared expert. `shared_l1_acts` is the local `x` region (and
+    // `shared_l1_acts_sf` its K-major per-128 SF); `shared_l2_acts` is the post-SwiGLU
+    // pool written by the fused L1 epilogue (zero-sized when the shared expert is off).
+    // The weight tensors are undefined when `num_shared_experts == 0`.
+    const torch::Tensor& shared_l1_acts, const torch::Tensor& shared_l1_acts_sf,
+    const torch::Tensor& shared_l2_acts, const torch::Tensor& shared_l2_acts_sf,
+    const torch::Tensor& shared_l1_weights, const torch::Tensor& shared_l2_weights,
+    const torch::Tensor& shared_l1_weights_sf, const torch::Tensor& shared_l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
+    const int& num_shared_experts,
     const float& activation_clamp,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const bool fuse_shared_experts = num_shared_experts > 0;
+    const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90(
@@ -179,8 +212,6 @@ static void sm90_fp8_mega_moe(
     const bool default_split_mn_barrier_opt =
         config.block_m == 128 and config.block_n == 256 and
         config.num_epilogue_threads == 512;
-    const bool split_phase_hot_path =
-        config.block_m == 128 and config.block_n == 256 and hidden >= 7168;
     const bool decode_split_n_path =
         config.block_m == 64 and config.num_epilogue_threads == 256;
     const bool decode_split_n_bn256 =
@@ -263,6 +294,75 @@ static void sm90_fp8_mega_moe(
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
 
+    // ---- Fused shared expert descriptors ----
+    // A: the local `x` region (K-major FP8) for L1 and the post-SwiGLU shared pool for L2,
+    // both with M = num_max_tokens_per_rank. Only the shared L2 activation SF gets a
+    // descriptor: the fused L1 epilogue writes it M-major, so a (BLOCK_M, 1) box is legal.
+    // The shared L1 activation SF (`x_sf`) is K-major, where that box would be 4 bytes and
+    // break TMA's 16-byte inner-box rule, so the loader warp gathers it into `smem_sfa`.
+    auto tensor_map_shared_l1_acts = tensor_map_l1_acts;
+    auto tensor_map_shared_l1_weights = tensor_map_l1_weights;
+    auto tensor_map_shared_l1_output = tensor_map_l1_output;
+    auto tensor_map_shared_l2_acts = tensor_map_l2_acts;
+    auto tensor_map_shared_l2_weights = tensor_map_l2_weights;
+    auto tensor_map_shared_l2_acts_sf = tensor_map_l2_acts_sf;
+    const float* shared_l1_weights_sf_ptr = l1_weights_sf.data_ptr<float>();
+    const float* shared_l2_weights_sf_ptr = l2_weights_sf.data_ptr<float>();
+    if (fuse_shared_experts) {
+        DG_HOST_ASSERT(shared_l1_acts.defined() and shared_l1_acts_sf.defined());
+        DG_HOST_ASSERT(shared_l2_acts.defined() and shared_l2_acts_sf.defined());
+        DG_HOST_ASSERT(static_cast<int>(shared_l1_acts.size(0)) == num_max_tokens_per_rank);
+        DG_HOST_ASSERT(static_cast<int>(shared_l1_acts.size(1)) == hidden);
+        DG_HOST_ASSERT(static_cast<int>(shared_l1_acts_sf.size(0)) == num_max_tokens_per_rank);
+        DG_HOST_ASSERT(static_cast<int>(shared_l1_acts_sf.size(1)) == hidden / kGranK);
+        DG_HOST_ASSERT(static_cast<int>(shared_l2_acts.size(0)) == num_max_tokens_per_rank);
+        DG_HOST_ASSERT(static_cast<int>(shared_l2_acts.size(1)) == shared_intermediate_hidden);
+        DG_HOST_ASSERT(static_cast<int>(shared_l2_acts_sf.size(0)) == num_max_tokens_per_rank);
+        DG_HOST_ASSERT(static_cast<int>(shared_l2_acts_sf.size(1)) ==
+                       shared_intermediate_hidden / kL2ActsSFGranK);
+
+        tensor_map_shared_l1_acts = make_tma_2d_desc(shared_l1_acts,
+                                                     hidden, num_max_tokens_per_rank,
+                                                     config.block_k, config.block_m,
+                                                     static_cast<int>(shared_l1_acts.stride(-2)),
+                                                     config.swizzle_acts_mode);
+        tensor_map_shared_l1_weights = make_tma_2d_desc(shared_l1_weights,
+                                                        hidden, shared_intermediate_hidden * 2,
+                                                        config.block_k, weight_tma_block_n,
+                                                        static_cast<int>(shared_l1_weights.stride(-2)),
+                                                        config.swizzle_weights_mode);
+        tensor_map_shared_l1_output = make_tma_2d_desc(shared_l2_acts,
+                                                       shared_intermediate_hidden, num_max_tokens_per_rank,
+                                                       l1_output_box_n, l1_output_box_m,
+                                                       static_cast<int>(shared_l2_acts.stride(-2)),
+                                                       l1_output_swizzle_mode);
+        tensor_map_shared_l2_acts = make_tma_2d_desc(shared_l2_acts,
+                                                     shared_intermediate_hidden, num_max_tokens_per_rank,
+                                                     config.block_k, config.block_m,
+                                                     static_cast<int>(shared_l2_acts.stride(-2)),
+                                                     config.swizzle_acts_mode);
+        tensor_map_shared_l2_weights = make_tma_2d_desc(shared_l2_weights,
+                                                        shared_intermediate_hidden, hidden,
+                                                        config.block_k, weight_tma_block_n,
+                                                        static_cast<int>(shared_l2_weights.stride(-2)),
+                                                        config.swizzle_weights_mode);
+        shared_l1_weights_sf_ptr = shared_l1_weights_sf.data_ptr<float>();
+        shared_l2_weights_sf_ptr = shared_l2_weights_sf.data_ptr<float>();
+        // Shared L2 acts SF lives in the workspace, written M-major during the launch by the
+        // fused L1 epilogue, so it can TMA-load with a (BLOCK_M, 1) box. Re-view the same memory
+        // with {1, nmt} strides (the caller already attaches those, mirroring the routed L2 SF
+        // pool) and build the descriptor.
+        auto shared_l2_acts_sf_mm = torch::from_blob(
+            shared_l2_acts_sf.data_ptr(),
+            {num_max_tokens_per_rank, shared_intermediate_hidden / kL2ActsSFGranK},
+            {1, num_max_tokens_per_rank},
+            shared_l2_acts_sf.options());
+        tensor_map_shared_l2_acts_sf = make_tma_sf_desc(
+            cute::UMMA::Major::MN, shared_l2_acts_sf_mm,
+            num_max_tokens_per_rank, shared_intermediate_hidden,
+            config.block_m, kL2ActsSFGranK, 1, 0);
+    }
+
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
@@ -281,7 +381,7 @@ static void sm90_fp8_mega_moe(
         .reuse_accum_as_final = reuse_accum_as_final,
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
-        .split_phase_hot_path = split_phase_hot_path,
+        .num_shared_experts = num_shared_experts,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -296,6 +396,14 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
+        .tensor_map_shared_l1_acts = tensor_map_shared_l1_acts,
+        .tensor_map_shared_l1_weights = tensor_map_shared_l1_weights,
+        .shared_l1_weights_sf = shared_l1_weights_sf_ptr,
+        .tensor_map_shared_l1_output = tensor_map_shared_l1_output,
+        .tensor_map_shared_l2_acts = tensor_map_shared_l2_acts,
+        .tensor_map_shared_l2_weights = tensor_map_shared_l2_weights,
+        .shared_l2_weights_sf = shared_l2_weights_sf_ptr,
+        .tensor_map_shared_l2_acts_sf = tensor_map_shared_l2_acts_sf,
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

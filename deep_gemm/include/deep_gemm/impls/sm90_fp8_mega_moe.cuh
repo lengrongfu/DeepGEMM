@@ -66,49 +66,15 @@ __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
 }
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
-          uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
-          uint32_t kNumExpertsPerRank,
-          uint32_t kNumExpertsPerWave,
-          uint32_t kNumSMs, uint32_t kNumRanks,
-          uint32_t kNumExpertsPerLane,
-          uint32_t kNumL1BlockNs, uint32_t kNumL2BlockNs,
-          uint32_t kNumL1BlockKs, uint32_t kNumL2BlockKs,
-          typename L1Func, typename L2Func>
-CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
-    sched::MegaMoESM90Scheduler<BLOCK_M, BLOCK_N, BLOCK_K,
-                            L1_SHAPE_N, L1_SHAPE_K,
-                            L2_SHAPE_N, L2_SHAPE_K,
-                            kNumExpertsPerRank,
-                            kNumExpertsPerWave,
-                            kNumSMs, kNumRanks,
-                            kNumExpertsPerLane,
-                            kNumL1BlockNs, kNumL2BlockNs,
-                            kNumL1BlockKs, kNumL2BlockKs>& scheduler,
-    L1Func&& l1_func, L2Func&& l2_func) {
-    scheduler.fetch_expert_recv_count();
-    scheduler.set_expert_idx(0);
-
-    while (true) {
-        CUTE_TIE_DECL(scheduler.get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
-        if (block_phase == sched::MegaMoESM90BlockPhase::None)
-            break;
-
-        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-            l1_func(current_local_expert_idx, kNumL1BlockKs, m_block_idx, n_block_idx);
-        } else {
-            l2_func(current_local_expert_idx, kNumL2BlockKs, m_block_idx, n_block_idx);
-        }
-    }
-}
-
 // ============================================================================
 // SM90 (Hopper) FP8 MegaMoE — full implementation
 // ----------------------------------------------------------------------------
 // Pipeline (cluster=1, no TMA multicast):
 //   * Dispatch warps: pull tokens (FP8) and SF (per-128 channel float) from
 //     remote ranks via NVLink into the local L1 pool.
+//   * Producer warp: claims L1/L2 tasks (routed, plus SharedLinear1/2 when the
+//     shared expert is fused in) from global atomic counters and publishes them
+//     into a 2-stage SMEM task ring that every consumer warp drains in order.
 //   * GEMM TMA-load warps (1 for A+SFA, 1 for B+SFB) feed the pipeline stages.
 //   * Math warpgroups (totalling kNumEpilogueThreads) consume each
 //     stage with WGMMA, accumulate into registers, then run the epilogue:
@@ -128,7 +94,6 @@ template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
     uint32_t kNumExperts, uint32_t kNumTopk,
-    uint32_t kNumExpertsPerWave,
     uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kNumMaxPoolTokens,
     uint32_t kNumPaddedSFPoolTokens,
@@ -142,7 +107,7 @@ template <
     bool kReuseAccumAsFinal,
     bool kL2ArrivalCounter,
     bool kL2EpilogueRequiresFullSync,
-    bool kSplitPhaseHotPath,
+    uint32_t kNumSharedExperts = 0,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -168,17 +133,34 @@ sm90_fp8_mega_moe_impl(void* y,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                       const float* __restrict__ l2_weights_sf) {
+                       const float* __restrict__ l2_weights_sf,
+                       // Fused shared expert (only read when `kNumSharedExperts > 0`;
+                       // otherwise the host passes the routed descriptors as placeholders).
+                       // Shared L1 acts SF has no descriptor: `x_sf` is K-major, so a
+                       // (BLOCK_M, 1) box is illegal and the loader warp gathers the column
+                       // into `smem_sfa` itself. Shared L2 acts SF is written M-major by the
+                       // fused L1 epilogue, so it TMA-loads like the routed L2 SFA.
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights,
+                       const float* __restrict__ shared_l1_weights_sf,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_output,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                       const float* __restrict__ shared_l2_weights_sf,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // =====================================================================
     // Template checks
     // =====================================================================
-    DG_STATIC_ASSERT(kNumDispatchThreads >= 64 and kNumDispatchThreads % 64 == 0,
+    DG_STATIC_ASSERT(kNumDispatchThreads >= 32 and kNumDispatchThreads % 32 == 0,
                      "Invalid number of dispatch threads");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 64 or kNumNonEpilogueThreads == 128,
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 64 or kNumNonEpilogueThreads == 96 or
+                     kNumNonEpilogueThreads == 128,
                      "Invalid number of GEMM TMA warps");
+    DG_STATIC_ASSERT(kNumMMANonEpilogueWarps >= 3,
+                     "The scheduler needs a dedicated producer warp");
     DG_STATIC_ASSERT((kNumDispatchThreads + kNumNonEpilogueThreads) % 128 == 0,
                      "Math warpgroup start must be 128-thread aligned");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
@@ -205,12 +187,33 @@ sm90_fp8_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
+        if constexpr (kNumSharedExperts > 0) {
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_acts);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_output);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts_sf);
+        }
     }
 
     // =====================================================================
     // Workspaces and symmetric buffer slicing (mirror SM100 layout, except SF
     // for L2 activations uses per-64 K granularity)
     // =====================================================================
+    // Fused shared expert. `M` is this rank's own token count, the intermediate size
+    // is scaled by the number of shared experts, and there is no expert dimension.
+    constexpr bool kHasSharedExperts = kNumSharedExperts > 0;
+    constexpr uint32_t kSharedIntermediateHidden = kIntermediateHidden * kNumSharedExperts;
+    constexpr uint32_t SHARED_L1_SHAPE_N = kSharedIntermediateHidden * 2;
+    constexpr uint32_t SHARED_L1_SHAPE_K = kHidden;
+    constexpr uint32_t SHARED_L2_SHAPE_N = kHidden;
+    constexpr uint32_t SHARED_L2_SHAPE_K = kSharedIntermediateHidden;
+    // The shared activation SF buffers are plain K-major (see the loader): their row
+    // strides must stay 16-byte aligned for TMA, which `layout::Data` already enforces.
+    DG_STATIC_ASSERT(not kHasSharedExperts or kSharedIntermediateHidden % 256 == 0,
+                     "Shared intermediate hidden must be a multiple of 256");
+
     const auto workspace = layout::MegaMoESM90Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
@@ -240,8 +243,26 @@ sm90_fp8_mega_moe_impl(void* y,
     const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens, l1_topk_weights_buffer.get_end_ptr());
     const auto l2_sf_buffer    = layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens, l2_token_buffer.get_end_ptr());
 
-    // Combine input area
-    const auto combine_token_buffer = layout::Buffer(bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+    // Combine input area. The fused shared expert reduces through one extra slot
+    // (`topk_idx == kNumTopk`) written by the local rank only.
+    constexpr uint32_t kNumCombineSlots = kNumTopk + (kHasSharedExperts ? 1u : 0u);
+    const auto combine_token_buffer = layout::Buffer(bf16_token_layout, kNumCombineSlots, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+
+    // Fused shared-expert area, appended after the combine buffer so the routed
+    // regions keep their relative order and are zero-sized when the shared expert is
+    // disabled (the workspace itself always reserves the shared arrival counters, so
+    // absolute offsets shift by a few KB either way -- host and device agree because
+    // both derive them from the same `MegaMoESM90Workspace`).
+    // The post-SwiGLU FP8 output and its per-64-K float SF are indexed by the local
+    // token index; the SF buffer is K-major (no SF-pool padding needed).
+    constexpr auto fp8_shared_intermediate_token_layout = layout::Data(kSharedIntermediateHidden);
+    constexpr auto fp8_shared_intermediate_sf_layout    = layout::Data(kSharedIntermediateHidden / 16);
+    const auto shared_l2_token_buffer = layout::Buffer(
+        fp8_shared_intermediate_token_layout, 1, kHasSharedExperts ? kNumMaxTokensPerRank : 0,
+        combine_token_buffer.get_end_ptr());
+    const auto shared_l2_sf_buffer = layout::Buffer(
+        fp8_shared_intermediate_sf_layout, 1, kHasSharedExperts ? kNumMaxTokensPerRank : 0,
+        shared_l2_token_buffer.get_end_ptr());
 
     // =====================================================================
     // GEMM data types and shape constants
@@ -354,6 +375,22 @@ sm90_fp8_mega_moe_impl(void* y,
     auto empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages + i; });
     auto combine_barriers  = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + i; });
 
+    // Interleaved-scheduler task ring: 2-stage task-info slots with dedicated
+    // full/empty barriers, placed right after the combine barriers (the host
+    // SMEM accounting reserves the same bytes, see `sm90_mega_moe.hpp`).
+    // `SM90MegaMoETaskInfo` is alignas(16) / 32 B, but barrier slots are 8 B,
+    // so the barrier count preceding the ring must be even for the 32 B slots
+    // to land 16-byte aligned. Pad one unused barrier slot when it is odd --
+    // this fires on the 1-dispatch-warp topology (parity is set by
+    // kNumDispatchWarps alone; 2*kNumStages and 2*kNumCombineWarps are even).
+    constexpr uint32_t kTaskInfoBaseBarriers =
+        kNumDispatchWarps + kNumStages * 2 + kNumCombineWarps * 2;
+    constexpr uint32_t kTaskInfoBarrierPad = kTaskInfoBaseBarriers & 1u;
+    auto task_info_full_barriers  = barrier_start_ptr + kTaskInfoBaseBarriers + kTaskInfoBarrierPad;
+    auto task_info_empty_barriers = task_info_full_barriers + sched::kNumSM90TaskInfoStages;
+    auto task_infos = reinterpret_cast<sched::SM90MegaMoETaskInfo*>(
+        task_info_empty_barriers + sched::kNumSM90TaskInfoStages);
+
     // =====================================================================
     // Initialization
     // =====================================================================
@@ -382,6 +419,13 @@ sm90_fp8_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumCombineWarps * 2; ++ i)
                 combine_barriers[i]->init(1);
+            #pragma unroll
+            for (uint32_t i = 0; i < sched::kNumSM90TaskInfoStages; ++ i) {
+                // The producer warp publishes one task per slot
+                task_info_full_barriers[i].init(1);
+                // TMA-A + TMA-B warps and every math warp release each slot once
+                task_info_empty_barriers[i].init(2 + kNumEpilogueWarps);
+            }
         }
         cutlass::arch::fence_barrier_init();
     }
@@ -390,12 +434,31 @@ sm90_fp8_mega_moe_impl(void* y,
     // =====================================================================
     // Scheduler (cluster=1)
     // =====================================================================
-    auto scheduler = sched::MegaMoESM90Scheduler<
+    constexpr uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
+    constexpr uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
+    constexpr uint32_t kNumSharedL1BlockNs = SHARED_L1_SHAPE_N / BLOCK_N;
+    constexpr uint32_t kNumSharedL1BlockKs = SHARED_L1_SHAPE_K / BLOCK_K;
+    constexpr uint32_t kNumSharedL2BlockKs = SHARED_L2_SHAPE_K / BLOCK_K;
+    // The shared L2 N shape equals the routed one, which the scheduler already checks
+    DG_STATIC_ASSERT(not kHasSharedExperts or kNumSharedL1BlockNs > 0,
+                     "BLOCK_N is too large for the shared-expert L1 shape");
+    // Number of K blocks for a task of the given phase
+    const auto get_num_k_blocks = [](const sched::MegaMoESM90BlockPhase& block_phase) -> uint32_t {
+        switch (block_phase) {
+            case sched::MegaMoESM90BlockPhase::Linear1:       return kNumL1BlockKs;
+            case sched::MegaMoESM90BlockPhase::Linear2:       return kNumL2BlockKs;
+            case sched::MegaMoESM90BlockPhase::SharedLinear1: return kNumSharedL1BlockKs;
+            default:                                          return kNumSharedL2BlockKs;
+        }
+    };
+    using SchedulerT = sched::MegaMoESM90Scheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
-        kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumExpertsPerRank,
+        kNumSMs, kNumRanks,
+        kNumSharedExperts>;
+    SchedulerT scheduler(workspace, task_info_full_barriers, task_info_empty_barriers, task_infos);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -681,6 +744,22 @@ sm90_fp8_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
+            // Reset the scheduler's global task counters for the next launch
+            if (warp_idx == 0 and cute::elect_one_sync()) {
+                *workspace.get_l1_task_count_ptr() = 0;
+                *workspace.get_l2_task_count_ptr() = 0;
+                if constexpr (kHasSharedExperts) {
+                    *workspace.get_shared_l1_task_count_ptr() = 0;
+                    *workspace.get_shared_l2_task_count_ptr() = 0;
+                }
+            }
+
+            if constexpr (kHasSharedExperts) {
+                // Reset the per-M-block shared L1 arrival counters
+                const uint32_t num_shared_blocks = math::ceil_div(num_tokens, BLOCK_M);
+                for (uint32_t i = thread_idx; i < num_shared_blocks; i += kNumDispatchThreads)
+                    *workspace.get_shared_l2_full_count_ptr(i) = 0;
+            }
         } else {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 const auto num_recv_tokens = static_cast<uint32_t>(
@@ -691,11 +770,21 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-                DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
-                if (warp_idx == 0) {
+                // Zero the per-expert recv-count sum on dispatch warp 0. The
+                // cumulative-stats red_add normally runs on dispatch warp 1;
+                // with the 32+96 topology the CTA has a single dispatch warp,
+                // so fold it onto warp 0's elect-one lane.
+                if (warp_idx == 0)
                     *workspace.get_expert_recv_count_sum_ptr(i) = 0;
-                } else if (warp_idx == 1) {
-                    if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
+                if constexpr (kNumDispatchWarps >= 2) {
+                    if (warp_idx == 1) {
+                        if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
+                            ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
+                        __syncwarp();
+                    }
+                } else {
+                    if (warp_idx == 0 and cute::elect_one_sync() and
+                        cumulative_local_expert_recv_stats != nullptr)
                         ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
                     __syncwarp();
                 }
@@ -726,29 +815,31 @@ sm90_fp8_mega_moe_impl(void* y,
     } else if (warp_idx == kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        auto process_a_sfa_block = [&](const auto& block_phase,
+        auto process_a_sfa_block = [&](const sched::MegaMoESM90BlockPhase& block_phase,
                                        const uint32_t& local_expert_idx,
                                        const uint32_t& num_k_blocks,
-                                       const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const auto tensor_map_a_ptr = block_phase == sched::MegaMoESM90BlockPhase::Linear2
-                ? &tensor_map_l2_acts : &tensor_map_l1_acts;
-            const auto tensor_map_sfa_ptr = block_phase == sched::MegaMoESM90BlockPhase::Linear2
-                ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
-
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
+                                       const uint32_t& m_block_idx, const uint32_t& n_block_idx,
+                                       const uint32_t& valid_m, const uint32_t& pool_block_idx) {
+            const bool is_shared = kHasSharedExperts and sched::is_shared_phase(block_phase);
+            const bool is_l1 = sched::is_l1_phase(block_phase);
+            // Shared L1 reads the local `x` directly; shared L2 reads the post-SwiGLU
+            // shared pool written by the L1 epilogue. Shared activation SF is read from
+            // global memory by the math warps, so no SFA descriptor is needed for it.
+            const auto tensor_map_a_ptr = is_shared
+                ? (is_l1 ? &tensor_map_shared_l1_acts : &tensor_map_shared_l2_acts)
+                : (is_l1 ? &tensor_map_l1_acts : &tensor_map_l2_acts);
+            const auto tensor_map_sfa_ptr = is_l1 ? &tensor_map_l1_acts_sf : &tensor_map_l2_acts_sf;
 
             // Wait for the pool to be ready
             if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                const auto expected = scheduler.template get_valid_m<false>();
-                while (ptx::ld_acq(ptr) != expected);
-            } else {
+                while (ptx::ld_acq(ptr) != valid_m);
+            } else if (block_phase == sched::MegaMoESM90BlockPhase::Linear2) {
                 constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
                 if constexpr (kL2ArrivalCounter) {
                     const auto ptr = reinterpret_cast<const uint32_t*>(
                         workspace.get_l2_arrival_mask_ptr(pool_block_idx));
-                    const uint32_t active_m_wgs = math::ceil_div(
-                        scheduler.template get_valid_m<false>(), WG_BLOCK_M);
+                    const uint32_t active_m_wgs = math::ceil_div(valid_m, WG_BLOCK_M);
                     const uint32_t expected =
                         kNumL1BlockNs * active_m_wgs * kWarpgroupSplitN * kL1OutputArrivalParts;
                     while (ptx::ld_acq(ptr) != expected);
@@ -759,21 +850,73 @@ sm90_fp8_mega_moe_impl(void* y,
                         ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
                     while (ptx::ld_acq_gpu(ptr) != expected);
                 }
+            } else if constexpr (kHasSharedExperts) {
+                // `SharedLinear1` has no dependency at all: `x` is resident before the
+                // launch. `SharedLinear2` waits for every shared L1 N tile of this M
+                // block, in the same counter mode the routed L2 uses.
+                if (block_phase == sched::MegaMoESM90BlockPhase::SharedLinear2) {
+                    const auto ptr = workspace.get_shared_l2_full_count_ptr(pool_block_idx);
+                    const uint32_t active_m_wgs = math::ceil_div(valid_m, WG_BLOCK_M);
+                    const uint32_t expected =
+                        kNumSharedL1BlockNs * active_m_wgs * kWarpgroupSplitN * kL1OutputArrivalParts;
+                    while (ptx::ld_acq(ptr) != expected);
+                }
             }
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
-                if (cute::elect_one_sync()) {
-                    const uint32_t m_idx = pool_block_idx * BLOCK_M;
-                    const uint32_t k_idx = k_block_idx * BLOCK_K;
+                // Shared tiles index the local token pool directly, so the padded
+                // SF-pool row mapping does not apply to them.
+                const uint32_t m_idx = pool_block_idx * BLOCK_M;
+                const uint32_t k_idx = k_block_idx * BLOCK_K;
 
+                // Shared L1 activation SF: `x_sf` is K-major, so a (BLOCK_M, 1) TMA box
+                // would be 4 bytes and break TMA's 16-byte inner-box rule. Gather the
+                // column into `smem_sfa` with the whole loader warp instead (BLOCK_M / 32
+                // loads per lane, once per stage, versus one per math thread every stage),
+                // so the math warps keep the uniform `ld_shared` path. `x_sf` is written
+                // before the launch and never mutated, hence `__ldg`. The stores are
+                // published by the mbarrier arrive below (which only counts TMA bytes).
+                if constexpr (kHasSharedExperts) {
+                    if (is_shared and is_l1) {
+                        constexpr uint32_t kNumInputSFGroups = kHidden / kGranK;
+                        const float* in_sf =
+                            input_sf_buffer.template get_base_ptr<float>() + k_block_idx;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < BLOCK_M / 32; ++ i) {
+                            const uint32_t row = i * 32 + lane_idx;
+                            smem_sfa[stage_idx][row] = __ldg(in_sf + (m_idx + row) * kNumInputSFGroups);
+                        }
+                    }
+                    __syncwarp();
+                }
+
+                if (cute::elect_one_sync()) {
                     // TMA load A
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
                         k_idx, m_idx, 1);
 
                     // TMA load SFA
-                    if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
+                    if (is_shared) {
+                        if (is_l1) {
+                            // Gathered above by the whole warp; no TMA bytes to expect
+                            full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
+                        } else {
+                            // Shared L2 acts SF: the fused L1 epilogue writes it M-major so a
+                            // (BLOCK_M, 1) TMA box is legal -- mirrors routed L2 SFA. Box is
+                            // (BLOCK_M, 1), so issue two single-group TMAs at smem offsets 0 and
+                            // BLOCK_M to match math's `+ 0 * BLOCK_M` / `+ 1 * BLOCK_M` reads.
+                            tma::copy<BLOCK_M, 1, 0, float>(
+                                &tensor_map_shared_l2_acts_sf, full_barriers[stage_idx],
+                                smem_sfa[stage_idx], m_idx, k_block_idx * 2, 1);
+                            tma::copy<BLOCK_M, 1, 0, float>(
+                                &tensor_map_shared_l2_acts_sf, full_barriers[stage_idx],
+                                smem_sfa[stage_idx] + BLOCK_M, m_idx, k_block_idx * 2 + 1, 1);
+                            full_barriers[stage_idx]->arrive_and_expect_tx(
+                                SMEM_A_SIZE_PER_STAGE + 2 * BLOCK_M * sizeof(float));
+                        }
+                    } else if (is_l1) {
                         // L1 SFA per-128: load (BLOCK_M, 1) at K=k_block_idx
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
@@ -799,49 +942,35 @@ sm90_fp8_mega_moe_impl(void* y,
             }
         };
 
-        if constexpr (kSplitPhaseHotPath) {
-            sm90_fp8_mega_moe_for_each_block_split(
-                scheduler,
-                [&](const uint32_t& local_expert_idx,
-                    const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    process_a_sfa_block(
-                        std::integral_constant<sched::MegaMoESM90BlockPhase, sched::MegaMoESM90BlockPhase::Linear1>{},
-                        local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                },
-                [&](const uint32_t& local_expert_idx,
-                    const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    process_a_sfa_block(
-                        std::integral_constant<sched::MegaMoESM90BlockPhase, sched::MegaMoESM90BlockPhase::Linear2>{},
-                        local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                });
-        } else {
-            scheduler.for_each_block([&](const sched::MegaMoESM90BlockPhase& block_phase,
-                                         const uint32_t& local_expert_idx,
-                                         const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                process_a_sfa_block(block_phase, local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-            });
+        typename SchedulerT::task_info_t task_info;
+        while (scheduler.get_next_task(task_info)) {
+            process_a_sfa_block(task_info.block_phase, task_info.local_expert_idx,
+                                get_num_k_blocks(task_info.block_phase),
+                                task_info.m_block_idx, task_info.n_block_idx,
+                                task_info.valid_m, task_info.pool_block_idx);
         }
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        scheduler.for_each_block([&](const sched::MegaMoESM90BlockPhase& block_phase,
-                                     const uint32_t& local_expert_idx,
-                                     const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const auto tensor_map_b_ptr =
-                block_phase == sched::MegaMoESM90BlockPhase::Linear2 ? &tensor_map_l2_weights : &tensor_map_l1_weights;
-
-            const uint32_t shape_n = block_phase == sched::MegaMoESM90BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
+        auto process_b_block = [&](const sched::MegaMoESM90BlockPhase& block_phase,
+                                   const uint32_t& local_expert_idx,
+                                   const uint32_t& num_k_blocks,
+                                   const uint32_t& n_block_idx,
+                                   const uint32_t& shape_n) {
+            const bool is_shared = kHasSharedExperts and sched::is_shared_phase(block_phase);
+            const bool is_l1 = sched::is_l1_phase(block_phase);
+            const auto tensor_map_b_ptr = is_shared
+                ? (is_l1 ? &tensor_map_shared_l1_weights : &tensor_map_shared_l2_weights)
+                : (is_l1 ? &tensor_map_l1_weights : &tensor_map_l2_weights);
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
                 if (cute::elect_one_sync()) {
-                    const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
+                    // The fused shared expert is a single dense MLP: no expert stride
+                    const uint32_t n_idx = (is_shared ? 0u : local_expert_idx * shape_n) +
+                                           n_block_idx * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
                     // TMA load B (weight SF is now loaded directly by math warps from global)
@@ -865,12 +994,28 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
-        });
+        };
+
+        typename SchedulerT::task_info_t task_info;
+        while (scheduler.get_next_task(task_info)) {
+            process_b_block(task_info.block_phase, task_info.local_expert_idx,
+                            get_num_k_blocks(task_info.block_phase),
+                            task_info.n_block_idx, task_info.shape_n);
+        }
+
+    } else if (warp_idx == kNumDispatchWarps + 2) {
+        // Producer warp: claims routed/shared L1/L2 tasks from the global atomic
+        // counters and publishes them into the SMEM task ring
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+
+        scheduler.mainloop(num_tokens);
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
-        // participate in the warpgroup-collective `setmaxnreg.dec.sync.aligned`
-        // so that the math warpgroup's `warpgroup_reg_alloc` can succeed.
+        // Idle/padding non-epilogue warps: none exist in the 32 + 96 topology this
+        // kernel uses (exactly TMA-A + TMA-B + producer). They must still take part
+        // in the warpgroup-collective `setmaxnreg.dec.sync.aligned` so the math
+        // warpgroup's `warpgroup_reg_alloc` succeeds if a wider non-epilogue
+        // section is ever configured.
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
@@ -901,12 +1046,11 @@ sm90_fp8_mega_moe_impl(void* y,
         // Sync with dispatch in the full communication path.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        auto process_math_block = [&](const auto& block_phase,
+        auto process_math_block = [&](const sched::MegaMoESM90BlockPhase& block_phase,
                                       const uint32_t& local_expert_idx,
                                       const uint32_t& num_k_blocks,
-                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const uint32_t valid_m = scheduler.template get_valid_m<false>();
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
+                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx,
+                                      const uint32_t& valid_m, const uint32_t& pool_block_idx) {
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
             const uint32_t n_idx = n_block_idx * BLOCK_N;
             const uint32_t epilogue_wg_m_idx = epilogue_wg_idx / kWarpgroupSplitN;
@@ -928,6 +1072,62 @@ sm90_fp8_mega_moe_impl(void* y,
             const uint32_t smem_cd_l2_wg_offset = epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N;
             const bool valid_r0 = row_offset_r0 < valid_m;
             const bool valid_r1 = row_offset_r1 < valid_m;
+
+            // Fused shared expert: a single dense MLP over this rank's own tokens.
+            // `is_shared` folds to a compile-time false when the feature is off.
+            const bool is_shared = kHasSharedExperts and sched::is_shared_phase(block_phase);
+            const bool is_l1 = sched::is_l1_phase(block_phase);
+            // Shared tiles always publish their L1 arrivals through a counter and never
+            // need the CTA-wide L2 epilogue sync; the routed modes are compile-time.
+            const bool use_arrival_counter = kL2ArrivalCounter or is_shared;
+            const bool needs_l2_full_sync = kL2EpilogueRequiresFullSync and not is_shared;
+
+            // Activation SF for the current K block, read from the TMA/gather-staged SMEM
+            // tile. All four phases share one layout: L1-like phases put one per-128-K
+            // float per row at offset 0; L2-like phases put the two per-64-K groups at
+            // offsets 0 and BLOCK_M (`_hi` is only written for those). Shared tiles are
+            // staged by the same loader warp (`process_a_sfa_block`), so no phase test is
+            // needed here.
+            auto load_act_sf = [&](float& lo_0, float& lo_1, float& hi_0, float& hi_1) {
+                if (is_l1) {
+                    lo_0 = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
+                    lo_1 = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
+                } else {
+                    lo_0 = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r0);
+                    lo_1 = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r1);
+                    hi_0 = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r0);
+                    hi_1 = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r1);
+                }
+            };
+
+            // Block (128, 128) weight SF lookups. The shared expert has no per-expert
+            // stride and its gate/up N halves are `kSharedIntermediateHidden` apart.
+            auto load_l1_weight_sf = [&](const uint32_t& k_block_idx, float& gate_sf, float& up_sf) {
+                constexpr uint32_t kSFKBlocks = kHidden / 128;
+                const uint32_t gate_n = sf_n_block_idx / 2u;
+                if (is_shared) {
+                    constexpr uint32_t kSFGateBlks = kSharedIntermediateHidden / 128;
+                    const float* base = shared_l1_weights_sf + k_block_idx;
+                    gate_sf = __ldg(base + gate_n * kSFKBlocks);
+                    up_sf   = __ldg(base + (kSFGateBlks + gate_n) * kSFKBlocks);
+                } else {
+                    constexpr uint32_t kSFGateBlks = kIntermediateHidden / 128;
+                    constexpr uint32_t kSFPerExpert = (kIntermediateHidden * 2 / 128) * kSFKBlocks;
+                    const float* base = l1_weights_sf + local_expert_idx * kSFPerExpert + k_block_idx;
+                    gate_sf = __ldg(base + gate_n * kSFKBlocks);
+                    up_sf   = __ldg(base + (kSFGateBlks + gate_n) * kSFKBlocks);
+                }
+            };
+            auto load_l2_weight_sf = [&](const uint32_t& k_block_idx) -> float {
+                if (is_shared) {
+                    constexpr uint32_t kSFKBlocks = kSharedIntermediateHidden / 128;
+                    return __ldg(shared_l2_weights_sf + sf_n_block_idx * kSFKBlocks + k_block_idx);
+                }
+                constexpr uint32_t kSFKBlocks = kIntermediateHidden / 128;
+                constexpr uint32_t kSFPerExpert = (kHidden / 128) * kSFKBlocks;
+                return __ldg(l2_weights_sf + local_expert_idx * kSFPerExpert +
+                             sf_n_block_idx * kSFKBlocks + k_block_idx);
+            };
 
             // ---------------- GEMM ----------------
             using WGMMA = L1WGMMA;
@@ -1050,34 +1250,15 @@ sm90_fp8_mega_moe_impl(void* y,
 
                         float scale_a_0_lo, scale_a_1_lo;
                         float scale_a_0_hi, scale_a_1_hi;
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                            scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
-                            scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
-                        } else {
-                            scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r0);
-                            scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r1);
-                            scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r0);
-                            scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r1);
-                        }
+                        load_act_sf(scale_a_0_lo, scale_a_1_lo, scale_a_0_hi, scale_a_1_hi);
 
-                        constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
-                        constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
-                        constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
-                        constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
-                        constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
                         float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                            const uint32_t gate_n = sf_n_block_idx / 2u;
-                            const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                            const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
-                            gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
-                            up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
-                        } else {
-                            l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
-                                                        + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
-                        }
+                        if (is_l1)
+                            load_l1_weight_sf(k_block_idx, gate_sf, up_sf);
+                        else
+                            l2_sf = load_l2_weight_sf(k_block_idx);
 
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
+                        if (is_l1) {
                             if (k_block_idx != 0)
                                 rescale_l1_final(prev_scale_a_0, prev_scale_a_1,
                                                  prev_gate_sf, prev_up_sf,
@@ -1158,7 +1339,7 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
 
                     if (num_k_blocks != 0) {
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
+                        if (is_l1) {
                             postscale_l1_final(prev_scale_a_0, prev_scale_a_1,
                                                prev_gate_sf, prev_up_sf);
                         } else {
@@ -1171,34 +1352,15 @@ sm90_fp8_mega_moe_impl(void* y,
 
                         float scale_a_0_lo, scale_a_1_lo;
                         float scale_a_0_hi, scale_a_1_hi;
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                            scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
-                            scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
-                        } else {
-                            scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r0);
-                            scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r1);
-                            scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r0);
-                            scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r1);
-                        }
+                        load_act_sf(scale_a_0_lo, scale_a_1_lo, scale_a_0_hi, scale_a_1_hi);
 
-                        constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
-                        constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
-                        constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
-                        constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
-                        constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
                         float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                            const uint32_t gate_n = sf_n_block_idx / 2u;
-                            const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                            const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
-                            gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
-                            up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
-                        } else {
-                            l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
-                                                        + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
-                        }
+                        if (is_l1)
+                            load_l1_weight_sf(k_block_idx, gate_sf, up_sf);
+                        else
+                            l2_sf = load_l2_weight_sf(k_block_idx);
 
-                        if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
+                        if (is_l1) {
                             if (k_block_idx != 0)
                                 prescale_l1_final(scale_a_0_lo, scale_a_1_lo, gate_sf, up_sf);
 
@@ -1278,16 +1440,7 @@ sm90_fp8_mega_moe_impl(void* y,
                     // Read SF (must precede warpgroup_arrive)
                     float scale_a_0_lo, scale_a_1_lo;
                     float scale_a_0_hi, scale_a_1_hi;  // Only used in L2 (per-64 K)
-                    if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                        scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
-                        scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
-                    } else {
-                        // L2: SFA layout is (K=2, M=BLOCK_M) MN-major; first half SF at offset 0, second at BLOCK_M
-                        scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r0);
-                        scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r1);
-                        scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r0);
-                        scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r1);
-                    }
+                    load_act_sf(scale_a_0_lo, scale_a_1_lo, scale_a_0_hi, scale_a_1_hi);
 
                     // ----- Block (128, 128) weight SF (loaded directly from global) -----
                     // L1 weight SF shape: (E, 2*IH/128, H/128) MN-major. The N axis is
@@ -1301,27 +1454,19 @@ sm90_fp8_mega_moe_impl(void* y,
                     // logical 128x128 weight-SF tile, broadcast across the matching
                     // WGMMA accumulators.
                     //
+                    // The fused shared expert uses the same layouts without the expert
+                    // dimension (see `load_l1_weight_sf` / `load_l2_weight_sf`).
+                    //
                     // Load the weight scale after the barrier from all WG threads.
                     // This keeps scale loads close to their WGMMA use and lets the
                     // read-only cache coalesce the same-address accesses.
-                    constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
-                    constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
-                    constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
-                    constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
-                    constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
                     float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
-                    if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                        const uint32_t gate_n = sf_n_block_idx / 2u;
-                        const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                        const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
-                        gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
-                        up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
-                    } else {
-                        l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
-                                                    + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
-                    }
+                    if (is_l1)
+                        load_l1_weight_sf(k_block_idx, gate_sf, up_sf);
+                    else
+                        l2_sf = load_l2_weight_sf(k_block_idx);
 
-                    if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
+                    if (is_l1) {
                         // Single per-128 K-block WGMMA group
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
@@ -1414,19 +1559,21 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
             }
 
-            // Skip epilogue when block is past valid M (still must release via empty)
+            // Skip epilogue when block is past valid M (still must release via empty).
+            // The taken paths below must issue the same aligned syncs, so both
+            // conditions are per-task (shared tiles always use counter arrivals).
             if (row_base >= valid_m) {
-                if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
-                    if constexpr (not kL2ArrivalCounter)
+                if (is_l1) {
+                    if (not use_arrival_counter)
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 } else {
-                    if constexpr (kL2EpilogueRequiresFullSync)
+                    if (needs_l2_full_sync)
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
                 return;
             }
 
-            if (block_phase == sched::MegaMoESM90BlockPhase::Linear1) {
+            if (is_l1) {
 
                 // ---------------- L1 EPILOGUE: activation + FP8 quantize + TMA store ----------------
                 // Layout in `final_accum`:
@@ -1498,13 +1645,14 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
 
-                // Apply token weight: SwiGLU * topk_weight (single load per row)
-                const float weight_r0 = valid_r0 ? *l1_topk_weights_buffer
+                // Apply token weight: SwiGLU * topk_weight (single load per row).
+                // The shared expert sees every token with weight 1.0.
+                const float weight_r0 = valid_r0 ? (is_shared ? 1.0f : *l1_topk_weights_buffer
                     .get_data_buffer(m_idx + row_offset_r0)
-                    .get_base_ptr<float>() : 0.0f;
-                const float weight_r1 = valid_r1 ? *l1_topk_weights_buffer
+                    .template get_base_ptr<float>()) : 0.0f;
+                const float weight_r1 = valid_r1 ? (is_shared ? 1.0f : *l1_topk_weights_buffer
                     .get_data_buffer(m_idx + row_offset_r1)
-                    .get_base_ptr<float>() : 0.0f;
+                    .template get_base_ptr<float>()) : 0.0f;
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     swiglu_r0[p][0] *= weight_r0;
@@ -1595,16 +1743,27 @@ sm90_fp8_mega_moe_impl(void* y,
                 // In the shared-SF split both warpgroups own the same per-64 group and rows, so
                 // only the first N-split warpgroup publishes the SF slot to avoid a write race.
                 if (col_idx == 0 and (not kSplitNSharesSF or epilogue_wg_n_idx == 0)) {
-                    auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
-                    // SF buffer is (kNumPaddedSFPoolTokens x kIntermediateHidden/64), MN-major:
-                    //   addr[k_idx * num_padded_sf_pool_tokens + token_idx]
-                    const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
-                    const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
                     const uint32_t k_sf_idx = sf_n_block_idx;  // one per-64 post-SwiGLU group
-                    if (valid_r0)
-                        sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r0] = sf_r0;
-                    if (valid_r1)
-                        sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
+                    if (is_shared) {
+                        // Shared SF buffer is (kNumMaxTokensPerRank x SIH/64) M-major and
+                        // indexed by the local token (token-contiguous inner, stride 1), so no
+                        // SF-pool padding applies:  addr[k_idx * kNumMaxTokensPerRank + token_idx]
+                        auto sf_base_ptr = shared_l2_sf_buffer.get_base_ptr<float>();
+                        if (valid_r0)
+                            sf_base_ptr[k_sf_idx * kNumMaxTokensPerRank + (m_idx + row_offset_r0)] = sf_r0;
+                        if (valid_r1)
+                            sf_base_ptr[k_sf_idx * kNumMaxTokensPerRank + (m_idx + row_offset_r1)] = sf_r1;
+                    } else {
+                        auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
+                        // SF buffer is (kNumPaddedSFPoolTokens x kIntermediateHidden/64), MN-major:
+                        //   addr[k_idx * num_padded_sf_pool_tokens + token_idx]
+                        const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
+                        const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
+                        if (valid_r0)
+                            sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r0] = sf_r0;
+                        if (valid_r1)
+                            sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
+                    }
                 }
 
                 // Sync the warpgroup before TMA store. In the shared-tile split
@@ -1631,7 +1790,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                         cute::tma_store_fence();
                         cute::SM90_TMA_STORE_2D::copy(
-                            &tensor_map_l1_output,
+                            is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output,
                             smem_cd_l1,
                             out_n_idx,
                             m_idx + row_base);
@@ -1642,7 +1801,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N + wg_l1_out_n_offset;
                         cute::tma_store_fence();
                         cute::SM90_TMA_STORE_2D::copy(
-                            &tensor_map_l1_output,
+                            is_shared ? &tensor_map_shared_l1_output : &tensor_map_l1_output,
                             smem_cd_l1 + smem_cd_l1_wg_offset,
                             out_n_idx,
                             m_idx + row_base);
@@ -1654,20 +1813,20 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 // Notify L2 that this L1 output (and SF) is ready. Counter mode lets
                 // independent WG tiles publish arrivals without the CTA-wide barrier
-                // needed before the single bit-mask update.
-                if constexpr (kL2ArrivalCounter) {
+                // needed before the single bit-mask update. Shared tiles always use a
+                // counter, on their own per-M-block slot.
+                if (use_arrival_counter) {
+                    auto arrival_ptr = is_shared
+                        ? workspace.get_shared_l2_full_count_ptr(pool_block_idx)
+                        : reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx));
                     if constexpr (kSplitNSharesSF) {
                         // The combined tile counts for both N-split warpgroups; the
                         // storing warpgroup publishes all kWarpgroupSplitN arrivals
                         // after its TMA store has drained.
-                        if (epilogue_wg_n_idx == 0 and warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                            ptx::red_add_rel(
-                                reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)),
-                                kWarpgroupSplitN);
-                        }
+                        if (epilogue_wg_n_idx == 0 and warp_idx_in_wg == 0 and cute::elect_one_sync())
+                            ptx::red_add_rel(arrival_ptr, kWarpgroupSplitN);
                     } else if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                        ptx::red_add_rel(
-                            reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)), 1);
+                        ptx::red_add_rel(arrival_ptr, 1);
                     }
                 } else {
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -1692,6 +1851,20 @@ sm90_fp8_mega_moe_impl(void* y,
                 const uint32_t lane_in_row = lane_idx % 16;
                 const uint32_t cols_per_lane = WG_BLOCK_N / 16;
 
+                // XOR column swizzle (8-col granularity) for the row-major BF16 staging
+                // tile. The row stride is WG_BLOCK_N/2 banks, which is a multiple of 32 for
+                // every supported WG_BLOCK_N (64/128), so 8 lanes that share a col_idx (8
+                // distinct row_idx) all hit the same bank -> 8-way conflict on each STS.
+                // XORing bits [3:5] of the column with (row & 7) spreads those 8 rows across
+                // 8 distinct banks. The swizzle MUST be applied on both the STS write and the
+                // LDS scatter read so the permutation cancels out. The 8-col granularity is
+                // safe: the 2-BF16 STS pair and the cols_per_lane-BF16 LDS vector (4 or 8
+                // BF16, the only sizes this path supports) never straddle an 8-col block, so
+                // the key is constant across each access.
+                auto swiz_col = [](uint32_t row, uint32_t col) -> uint32_t {
+                    return col ^ ((row & 7) << 3);
+                };
+
                 // STSM into smem_cd_l2 (BF16). Reuse SM100 column-swizzle layout.
                 #pragma unroll
                 for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
@@ -1705,7 +1878,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         auto smem_ptr = smem_cd_l2
                             + smem_cd_l2_wg_offset
                             + row * WG_BLOCK_N
-                            + col;
+                            + swiz_col(row, col);
                         // BF16 STS: 2 bf16 elements
                         *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
                     };
@@ -1747,16 +1920,27 @@ sm90_fp8_mega_moe_impl(void* y,
                     if (m_idx_in_block >= valid_m) break;
 
                     // Read cols_per_lane BF16 (= one ScatterVec) from smem
+                    uint32_t read_col = lane_in_row * cols_per_lane;
+                    read_col = swiz_col(row_in_wg, read_col);
                     auto smem_ptr = smem_cd_l2
                         + smem_cd_l2_wg_offset
                         + row_in_wg * WG_BLOCK_N
-                        + lane_in_row * cols_per_lane;
+                        + read_col;
                     const auto packed = *reinterpret_cast<ScatterVec*>(smem_ptr);
 
-                    const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                    const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                    const uint32_t dst_token_idx = src_metadata.token_idx;
-                    const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                    // The fused shared expert stays on this rank and reduces through the
+                    // extra combine slot `kNumTopk`, keyed by the local token index.
+                    uint32_t dst_rank_idx, dst_token_idx, dst_topk_idx;
+                    if (is_shared) {
+                        dst_rank_idx = sym_buffer.rank_idx;
+                        dst_token_idx = m_idx + m_idx_in_block;
+                        dst_topk_idx = kNumTopk;
+                    } else {
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
+                        dst_rank_idx = src_metadata.rank_idx;
+                        dst_token_idx = src_metadata.token_idx;
+                        dst_topk_idx = src_metadata.topk_idx;
+                    }
                     const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                            .get_data_buffer(dst_token_idx);
                     auto dst_ptr = math::advance_ptr<ScatterVec>(
@@ -1765,35 +1949,17 @@ sm90_fp8_mega_moe_impl(void* y,
                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                 }
 
-                if constexpr (kL2EpilogueRequiresFullSync)
+                if (needs_l2_full_sync)
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
         };
 
-        if constexpr (kSplitPhaseHotPath) {
-            sm90_fp8_mega_moe_for_each_block_split(
-                scheduler,
-                [&](const uint32_t& local_expert_idx,
-                    const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    process_math_block(
-                        std::integral_constant<sched::MegaMoESM90BlockPhase, sched::MegaMoESM90BlockPhase::Linear1>{},
-                        local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                },
-                [&](const uint32_t& local_expert_idx,
-                    const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    process_math_block(
-                        std::integral_constant<sched::MegaMoESM90BlockPhase, sched::MegaMoESM90BlockPhase::Linear2>{},
-                        local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                });
-        } else {
-            scheduler.for_each_block([&](const sched::MegaMoESM90BlockPhase& block_phase,
-                                         const uint32_t& local_expert_idx,
-                                         const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                process_math_block(block_phase, local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-            });
+        typename SchedulerT::task_info_t task_info;
+        while (scheduler.get_next_task(task_info)) {
+            process_math_block(task_info.block_phase, task_info.local_expert_idx,
+                               get_num_k_blocks(task_info.block_phase),
+                               task_info.m_block_idx, task_info.n_block_idx,
+                               task_info.valid_m, task_info.pool_block_idx);
         }
 
         // ---------------- COMBINE ----------------
@@ -1833,7 +1999,7 @@ sm90_fp8_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
         DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements");
-        DG_STATIC_ASSERT(kNumTopk <= 32, "Top-k must fit in a single warp");
+        DG_STATIC_ASSERT(kNumCombineSlots <= 32, "Top-k (plus the shared slot) must fit in a single warp");
 
         DG_TRAP_ONLY_DEVICE_ASSERT(kNumChunkSlots * kNumCombineWarps * kNumChunkBytes <= static_cast<uint32_t>(
             reinterpret_cast<uint8_t*>(barrier_start_ptr) - smem_buffer));
@@ -1853,8 +2019,12 @@ sm90_fp8_mega_moe_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumCombineWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumCombineWarps) {
+            // Slots `[0, kNumTopk)` are the routed experts (negative expert id means the
+            // slot was masked out). With the fused shared expert, slot `kNumTopk` is
+            // always present and holds this rank's shared-expert contribution.
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
+                static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) :
+                ((kHasSharedExperts and lane_idx == kNumTopk) ? static_cast<int>(kNumTopk) : -1);
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {

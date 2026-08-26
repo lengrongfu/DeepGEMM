@@ -98,14 +98,15 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
 class Sm90SymmBuffer:
     """Symmetric buffer for the SM90 (Hopper) FP8 MegaMoE path (`fp8_mega_moe_sm90`).
 
-    Unlike `SymmBuffer` (SM100), this always uses FP8xFP8 with float scale factors, a pool-based
-    (non-ring) workspace, and does not support shared experts or the `situ` activation.
+    Unlike `SymmBuffer` (SM100), this always uses FP8xFP8 with float scale factors and a
+    pool-based (non-ring) workspace, and does not support the `situ` activation.
     """
 
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
+                 num_shared_experts: int = 0,
                  activation: str = 'swiglu'):
         assert activation == 'swiglu', f'SM90 MegaMoE only supports `swiglu`, got activation={activation!r}'
         self.group = group
@@ -120,7 +121,8 @@ class Sm90SymmBuffer:
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            True, activation
+            True, activation,
+            num_shared_experts
         )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -137,7 +139,8 @@ class Sm90SymmBuffer:
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf,
+         self.shared_l2_acts, self.shared_l2_acts_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self):
         self.handle = None
@@ -151,6 +154,7 @@ def get_symm_buffer_for_sm90_mega_moe(group: dist.ProcessGroup,
                                       num_experts: int,
                                       num_max_tokens_per_rank: int, num_topk: int,
                                       hidden: int, intermediate_hidden: int,
+                                      num_shared_experts: int = 0,
                                       activation: str = 'swiglu') -> Sm90SymmBuffer:
     # Align token count (SM90 MegaMoE shares the same token alignment requirement as SM100)
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
@@ -159,6 +163,7 @@ def get_symm_buffer_for_sm90_mega_moe(group: dist.ProcessGroup,
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
+        num_shared_experts,
         activation=activation
     )
 
@@ -296,19 +301,23 @@ def fp8_mega_moe_sm90(y: torch.Tensor,
                       l1_weights: Tuple[torch.Tensor, torch.Tensor],
                       l2_weights: Tuple[torch.Tensor, torch.Tensor],
                       sym_buffer: Sm90SymmBuffer,
+                      shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                      shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                       cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                       recipe: Tuple[int, int, int] = (128, 128, 128),
                       activation: str = 'swiglu',
                       activation_clamp: Optional[float] = None,
                       fast_math: bool = True):
-    """SM90 (Hopper) FP8 MegaMoE fused GEMM, ported from upstream PR #36.
+    """SM90 (Hopper) FP8 MegaMoE fused GEMM, ported from upstream PR #36, with the
+    interleaved scheduler and fused shared-expert support ported from PR #69.
 
-    Unlike `fp8_fp4_mega_moe` (SM100), both L1/L2 weights are FP8 e4m3 with block-(128, 128)
-    float scale factors (not FP4/UE8M0), and there is no shared-expert or `situ` support.
+    Unlike `fp8_fp4_mega_moe` (SM100), both L1/L2 weights (routed and shared) are FP8 e4m3
+    with block-(128, 128) float scale factors (not FP4/UE8M0), and there is no `situ` support.
     """
     _C.fp8_mega_moe_sm90(
         y,
         l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),

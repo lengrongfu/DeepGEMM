@@ -34,7 +34,6 @@ struct MegaMoESM90Config {
     int num_max_pool_tokens;
     int num_padded_sf_pool_tokens;
     int swizzle_acts_mode, swizzle_weights_mode;
-    int num_experts_per_wave;
     int num_stages, smem_size;
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
 
@@ -45,7 +44,6 @@ struct MegaMoESM90Config {
            << ", num_max_pool_tokens=" << config.num_max_pool_tokens
            << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
-           << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -74,59 +72,6 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
-// Base (non-arch-specific) heuristic for how many local experts to batch into a single
-// scheduling "wave". Ported as-is from the old `dev` branch's shared
-// `get_num_experts_per_wave_for_mega_moe` (pre-dates `nv_dev`'s ring-buffer scheduler, which has
-// no equivalent wave concept), kept private to the SM90 path since nothing else references it.
-static int get_num_experts_per_wave_for_mega_moe(
-    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
-    float expected_tokens_per_expert = static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    if (expected_tokens_per_expert < 1) {
-        // Most experts don't have tokens, calculate all experts at once
-        return num_experts_per_rank;
-    }
-
-    // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
-    constexpr int kImbalanceFactor = 2;
-
-    // Count L1 blocks per expert assuming tokens are evenly spread across experts
-    const int num_m_blocks = ceil_div(static_cast<int>(std::ceil(expected_tokens_per_expert)), block_m);
-    const int num_n_blocks = (2 * intermediate_hidden) / block_n;
-    const int num_l1_blocks_per_expert = num_m_blocks * num_n_blocks;
-
-    // Pick the smallest value whose total blocks (after imbalance reduction) can keep all SMs busy
-    int num_experts_per_wave = num_l1_blocks_per_expert > 0
-        ? ceil_div(kImbalanceFactor * num_sms, num_l1_blocks_per_expert) : 1;
-    num_experts_per_wave = std::min(num_experts_per_wave, num_experts_per_rank);
-
-    // Round up to the nearest divisor of num_experts_per_rank so every wave processes the same count
-    while (num_experts_per_wave < num_experts_per_rank and num_experts_per_rank % num_experts_per_wave != 0)
-        ++ num_experts_per_wave;
-
-    return num_experts_per_wave;
-}
-
-static int get_num_experts_per_wave_for_mega_moe_sm90(
-    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
-    const float expected_tokens_per_expert =
-        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)
-        return num_experts_per_rank;
-
-    if (block_m == 64 and intermediate_hidden >= 3072) {
-        const int num_n_blocks_per_expert = (2 * intermediate_hidden) / block_n;
-        const int single_wave_blocks =
-            num_experts_per_rank * num_n_blocks_per_expert;
-        if (single_wave_blocks >= 4 * num_sms)
-            return num_experts_per_rank;
-    }
-    return get_num_experts_per_wave_for_mega_moe(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
-}
-
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
@@ -150,9 +95,21 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_per_stage = block_m * block_k + block_n * block_k +
                                smem_sfa_per_stage + smem_sfb_per_stage;
 
-    const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
+    // The interleaved scheduler adds a 2-stage task-info ring: 2 full + 2 empty
+    // barrier slots plus 2 `SM90MegaMoETaskInfo` (32 B, alignas(16)) slots, placed
+    // right after the combine barriers (see `sm90_fp8_mega_moe.cuh`). Barrier slots
+    // are 8 B, so the preceding barrier count must be even for the task-info slots
+    // to land 16-byte aligned; pad one unused barrier slot when it is odd. Only
+    // `num_dispatch_warps` affects that parity here (2*num_stages and
+    // 2*num_epilogue_warps are always even).
+    const int smem_task_info_barriers = 4;  // 2 full + 2 empty
+    const int smem_task_info_pad = (num_dispatch_warps & 1) * 8;
+    const int smem_barriers_fixed =
+        (num_dispatch_warps + 2 * num_epilogue_warps + smem_task_info_barriers) * 8 +
+        smem_task_info_pad;
+    const int smem_task_infos = 2 * 32;
     const int smem_barriers_per_stage = 2 * 8;
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed + smem_task_infos;
 
     const int num_stages = (smem_capacity - smem_fixed) /
                            (smem_per_stage + smem_barriers_per_stage);
@@ -187,21 +144,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
 
-    const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
-
-    const bool reduce_decode_threads = num_epilogue_threads == 128;
-    const bool decode_split_n =
-        block_m == 64 and num_epilogue_threads == 256;
-    const bool shrink_non_epilogue = reduce_decode_threads or decode_split_n;
-    const int num_dispatch_threads =
-        (num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128;
-    const bool split_sfa_loader_warp = false;
-    const int num_non_epilogue_threads =
-        split_sfa_loader_warp ? 128 :
-            ((num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128);
+    // The interleaved scheduler needs a dedicated producer warp on top of the two
+    // GEMM TMA-load warps (A+SFA, B+SFB), so the non-epilogue section is exactly 3
+    // warps and dispatch is a single warp: dispatch + non-epilogue = 32 + 96 = 128,
+    // a whole warpgroup that keeps the math warpgroups 128-thread aligned. This is
+    // the minimal aligned topology for every epilogue width (2-WG or 4-WG).
+    const int num_dispatch_threads = 32;
+    const int num_non_epilogue_threads = 96;
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
@@ -215,7 +164,6 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         cluster_size,
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
-        num_experts_per_wave,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };
