@@ -104,7 +104,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens,
-        /*with_sf=*/ true, num_shared_experts, scale_layout_spec);
+        /*with_sf=*/ true, num_shared_experts,
+        /*num_mma_elem_bits_opt=*/ 0, /*sf_gran_k=*/ 32, /*shared_num_mma_elem_bits_opt=*/ 0,
+        scale_layout_spec);
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
     const auto num_max_shared_sf_tokens =
         layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank);

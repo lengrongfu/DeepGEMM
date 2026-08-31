@@ -440,6 +440,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, kNumSFRingTokens, /*with_sf=*/ true,
         kNumSharedExperts,
+        /*num_mma_elem_bits_opt=*/ 0, /*sf_gran_k=*/ 32, /*shared_num_mma_elem_bits_opt=*/ 0,
         layout::ScaleLayoutSpec::sm90_fp32_k128_k64(
             kHidden, kIntermediateHidden));
     const auto workspace = buffer.workspace;
@@ -786,7 +787,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumSMs, kNumRanks,
-        kNumRingBlocks, kNumSharedExperts, 1,
+        kNumRingBlocks, kNumSharedExperts, BLOCK_K, 1,
         kSmallMSwapAB and
             (kLocalSwapABTokens == 8 or kLocalSwapABTokens == 64)>;
     auto scheduler = scheduler_t(
