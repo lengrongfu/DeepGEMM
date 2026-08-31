@@ -51,6 +51,7 @@ public:
         bool reuse_accum_as_final;
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
+        bool use_swap_ab;
         int num_shared_experts;
         MegaMoESM90Config config;
 
@@ -112,6 +113,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -131,6 +133,7 @@ static void __instantiate_kernel() {{
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
+    args.use_swap_ab ? "true" : "false",
     args.num_shared_experts);
     }
 
@@ -222,6 +225,9 @@ static void sm90_fp8_mega_moe(
         default_split_mn_barrier_opt or decode_l2_counter;
     const bool l2_epilogue_requires_full_sync =
         not l2_arrival_counter;
+    const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
+        num_experts_per_rank, num_tokens, num_topk,
+        config.block_m, config.num_epilogue_threads);
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).
@@ -269,11 +275,12 @@ static void sm90_fp8_mega_moe(
     const int wg_l1_out_block_n = wg_block_n / 2;
     const bool split_n_shares_sf =
         split_n_warpgroups and wg_l1_out_block_n < kL2ActsSFGranK;
+    const bool l1_output_full_tile = split_n_shares_sf or use_swap_ab;
     const int l1_output_swizzle_mode = 0;
     const int l1_output_box_n =
-        split_n_shares_sf ? config.block_n / 2 : wg_l1_out_block_n;
+        l1_output_full_tile ? config.block_n / 2 : wg_l1_out_block_n;
     const int l1_output_box_m =
-        split_n_shares_sf ? config.block_m : wg_block_m;
+        l1_output_full_tile ? config.block_m : wg_block_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_max_pool_tokens,
                                                        l1_output_box_n, l1_output_box_m,
@@ -381,6 +388,7 @@ static void sm90_fp8_mega_moe(
         .reuse_accum_as_final = reuse_accum_as_final,
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
+        .use_swap_ab = use_swap_ab,
         .num_shared_experts = num_shared_experts,
         .config = config,
         .y = y.data_ptr(),

@@ -72,11 +72,31 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
+static bool should_use_swap_ab_for_mega_moe_sm90(
+    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
+    const int& block_m, const int& num_epilogue_threads) {
+    // swapAB swaps the WGMMA operand roles for very small M (decode) tiles so the
+    // routed-weight operand becomes the WGMMA-N side (which tolerates small sizes via
+    // the `N_SWAP` dynamic dispatch below) instead of stalling the fixed WG_BLOCK_N-wide
+    // routed path on a mostly-empty M dimension.
+    // Kill-switch retained: set DG_SM90_FP8_SWAP_AB=0 to force the non-swap path.
+    // swapAB composes with the fused shared expert (shared's token-axis output
+    // matches swapAB's reduced M-axis), so no special-casing is needed here.
+    if (get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
+        return false;
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    const bool decode_split_n_path =
+        block_m == 64 and num_epilogue_threads == 256;
+    return decode_split_n_path and num_tokens <= 128 and expected_tokens_per_expert > 0.0f;
+}
+
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
-    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const bool& use_swap_ab = false) {
     constexpr int kSmemAlignment = 1024;
 
     const int smem_expert_count_size = align(
@@ -88,7 +108,15 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
 
     const int smem_cd_l1 = block_m * (block_n / 2);
     const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
-    const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+    // swapAB stages the L1 output in a joint FP32 (amax) + FP8 (quantized) tile
+    // instead of the routed FP8-only staging tile.
+    const int smem_cd_swap_l1 = use_swap_ab
+        ? block_m * (block_n / 2) *
+              (static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(uint8_t)))
+        : 0;
+    const int smem_cd = align(
+        std::max(std::max(smem_cd_l1, smem_cd_l2), smem_cd_swap_l1),
+        kSmemAlignment);
 
     const int smem_sfa_per_stage = align(2 * block_m * static_cast<int>(sizeof(float)), 128);
     const int smem_sfb_per_stage = 0;
@@ -135,8 +163,12 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         decode_split_n_path and intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 0.25f and
         (2 * intermediate_hidden) % 256 == 0;
-    const int block_n = auto_split_mn ? 256
-                                      : (decode_use_block_n_256 ? 256 : 128);
+    const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
+        num_experts_per_rank, num_tokens, num_topk,
+        block_m, num_epilogue_threads);
+    const int block_n = use_swap_ab ? 256
+                                    : (auto_split_mn ? 256 :
+                                       (decode_use_block_n_256 ? 256 : 128));
     const int block_k = 128;
     const int cluster_size = 1;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
@@ -157,7 +189,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32);
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        use_swap_ab);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
