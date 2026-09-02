@@ -93,8 +93,26 @@ get_symm_buffer_size_for_mega_moe(
     // packed-UE8M0-into-int32 layout; both use the same bytes per token, so the
     // symmetric buffer layout is shared and only the granularity/dtype differ.
     const auto is_sm90_nvfp4 = mma_kind == MmaKind::NVFP4 && device_runtime->get_arch_major() == 9;
+    // L1's dispatch-SF granularity is a fixed 128 elements/scale on SM90
+    // (`kL1ScaleGranK` in `sm90_nvfp4_mega_moe_h200_fused.hpp`, independent of
+    // the per-call BLOCK_M/BLOCK_N the heuristic picks), giving `hidden / 128`
+    // FP32 values/token -> `sf_gran_k = 32` in this function's "bytes-per-1"
+    // units (`hidden / sf_gran_k` bytes, 4 bytes/float => `hidden / (32*4)
+    // = hidden / 128` columns).
     const auto sf_gran_k = is_sm90_nvfp4 ? 32u : get_mma_sf_gran_k(mma_kind);
-    const auto l2_sf_gran_k = is_sm90_nvfp4 ? 16u : sf_gran_k;
+    // L2's dispatch-SF granularity is `config.block_n / 2` elements/scale
+    // (kernel-side: `l2_scale_gran_k` in `sm90_nvfp4_mega_moe_h200_fused.hpp`;
+    // matching `kL2ActsSFGranK` in the kernel body, which is 64 only for the
+    // BLOCK_M128/BLOCK_N128 split-M bucket and 128 for every other bucket --
+    // see `select_sm90_nvfp4_h200_fused`'s tuning table, BLOCK_N in {128,
+    // 256}). Each call is internally self-consistent (dispatch write and
+    // GEMM read use the same per-call granularity), but the buffer itself is
+    // allocated once and must fit the FINEST granularity used by *any* call
+    // (the smallest BLOCK_N, i.e. 128 -> 64 elements/scale -> the most SF
+    // columns, `intermediate_hidden / 64`); calls using a coarser 128
+    // elements/scale simply address a subset of those columns.
+    constexpr uint32_t kSM90MinL2ActsSFBlockN = 128u;
+    const auto l2_sf_gran_k = is_sm90_nvfp4 ? (kSM90MinL2ActsSFBlockN / 2u) / 4u : sf_gran_k;
 
     // Iterate all block candidates to get the maximum ring size.
     // NOTES: the SM90 fused NVFP4 kernel uses a static full pool (readiness
