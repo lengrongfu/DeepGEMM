@@ -78,7 +78,7 @@
     // =====================================================================
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::float_e4m3_t;
-    using task_info_t = sched::TaskInfo;
+    using task_info_t = sched::SM90TaskInfo;
     using interleaved_scheduler_t = sched::InterleavedMegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
@@ -295,12 +295,10 @@
     // =====================================================================
     // Scheduler (cluster=1)
     // =====================================================================
-    auto scheduler = sched::MegaMoEScheduler<
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        L1_SHAPE_N, L1_SHAPE_K,
-        L2_SHAPE_N, L2_SHAPE_K,
-        kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, 1>(workspace);
+    // NOTES: this port only wires up the interleaved (dynamic mailbox) task
+    // scheduler -- `select_sm90_nvfp4_h200_fused` always selects
+    // `use_interleaved_scheduler = true`, so the static/non-interleaved path
+    // below is unreachable and intentionally left unimplemented.
     auto interleaved_scheduler = interleaved_scheduler_t(
         workspace,
         task_info_full_barriers,
@@ -339,27 +337,10 @@
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
-    const auto for_each_static_selected_block = [&](auto&& func) {
-        scheduler.fetch_expert_recv_count();
-        scheduler.set_expert_idx(0);
-        while (true) {
-            CUTE_TIE_DECL(scheduler.get_next_block(),
-                          block_phase, local_expert_idx, m_block_idx, n_block_idx);
-            if (block_phase == sched::BlockPhase::None)
-                break;
-            if (block_phase == sched::BlockPhase::Linear1) {
-                func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
-                     local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
-                     scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>());
-            } else {
-                func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
-                     local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
-                     scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>());
-            }
-        }
-    };
+    // NOTES: the static (non-interleaved) scheduling path is unreachable (see
+    // note above) and is not ported; `if constexpr (kUseInterleavedScheduler)`
+    // guards below fail to compile with a clear message if ever instantiated
+    // with `kUseInterleavedScheduler = false`.
 
     const auto invoke_interleaved_task = [&](const task_info_t& task_info,
                                               auto&& func) {
@@ -411,7 +392,7 @@
                 const auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
-                const auto cleanup_pool_block_offset = scheduler.get_pool_block_offset(i);
+                const auto cleanup_pool_block_offset = interleaved_scheduler.get_pool_block_offset(i);
 
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -529,7 +510,7 @@
             const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
             const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
-            scheduler.fetch_expert_recv_count();
+            interleaved_scheduler.fetch_expert_recv_count();
 
             constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
             int      current_expert_idx = -1;
@@ -545,7 +526,7 @@
                         break;
                     expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
                     expert_start_idx = expert_end_idx;
-                    expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+                    expert_end_idx += interleaved_scheduler.get_num_tokens(current_expert_idx);
                 }
                 if (current_expert_idx >= kNumExpertsPerRank)
                     break;
@@ -750,7 +731,7 @@
         if constexpr (kUseInterleavedScheduler)
             for_each_published_block(load_a_task);
         else
-            for_each_static_selected_block(load_a_task);
+            static_assert(kUseInterleavedScheduler, "Static (non-interleaved) scheduling is not supported");
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -788,7 +769,7 @@
         if constexpr (kUseInterleavedScheduler)
             produce_interleaved_blocks(load_b_task);
         else
-            for_each_static_selected_block(load_b_task);
+            static_assert(kUseInterleavedScheduler, "Static (non-interleaved) scheduling is not supported");
 
     } else {
         // =====================================================================
@@ -1637,7 +1618,7 @@
         if constexpr (kUseInterleavedScheduler)
             for_each_published_block(run_math_task);
         else
-            for_each_static_selected_block(run_math_task);
+            static_assert(kUseInterleavedScheduler, "Static (non-interleaved) scheduling is not supported");
 
         // ---------------- COMBINE ----------------
         // NVLink barrier first: signals remote ranks that this rank's GEMM

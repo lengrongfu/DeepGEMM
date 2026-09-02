@@ -15,6 +15,10 @@ except Exception as exception:
 from .. import _C
 
 
+_SM90_NVFP4_H200_FUSED_LAYOUT_ATTR = "_deep_gemm_nvfp4_h200_fused_layout"
+_SM90_NVFP4_H200_FUSED_LAYOUT = "mode2_braided"
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -155,6 +159,70 @@ def transform_weights_for_mega_moe(
         l2_transformed = l2_weights
     return l1_transformed, l2_transformed
 
+
+def _braid_nvfp4_mode2_signs(fused_weight: torch.Tensor) -> torch.Tensor:
+    """Arrange FP4 sign bits for the fused Mode2 row/LUT decoders."""
+    if fused_weight.dtype != torch.uint8 or fused_weight.dim() != 3:
+        raise ValueError("fused NVFP4 weight must be a 3-D uint8 tensor")
+    experts, rows, storage_k = fused_weight.shape
+    if storage_k % 80 != 0:
+        raise ValueError("fused NVFP4 K storage must contain 80-byte BK128 tiles")
+
+    fused_rows = fused_weight.view(experts, rows, storage_k // 80, 80).clone()
+    packed = fused_rows[..., :64].view(experts, rows, storage_k // 80, 16, 4)
+    codes = torch.cat(((packed >> 4) & 0x0f, packed & 0x0f), dim=-1)
+    magnitudes = codes & 0x07
+    signs = codes >> 3
+    braided_signs = torch.stack(
+        (
+            signs[..., 4], signs[..., 0], signs[..., 5], signs[..., 1],
+            signs[..., 6], signs[..., 2], signs[..., 7], signs[..., 3],
+        ),
+        dim=-1,
+    )
+    braided_nibbles = magnitudes | (braided_signs << 3)
+    fused_rows[..., :64] = (
+        braided_nibbles[..., 0::2] | (braided_nibbles[..., 1::2] << 4)
+    ).reshape(experts, rows, storage_k // 80, 64)
+    return fused_rows.view(experts, rows, storage_k).contiguous()
+
+
+def transform_nvfp4_weights_for_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    block_n, block_k, group_size = 256, 128, 16
+    from ..quantization_nvfp4 import (
+        nvfp4_fuse_packed_with_scale_tile_major,
+        nvfp4_scale_to_tile_major,
+    )
+    l1_packed, l1_scale = l1_weights
+    l2_packed, l2_scale = l2_weights
+    assert l1_packed.dtype == torch.uint8 and l2_packed.dtype == torch.uint8
+    assert l1_scale.dtype == torch.uint8 and l2_scale.dtype == torch.uint8
+    assert l1_packed.dim() == 3 and l2_packed.dim() == 3
+    assert l1_scale.dim() == 3 and l2_scale.dim() == 3
+
+    l1_packed_il, l1_scale_il = _interleave_weights(l1_packed), _interleave_weights(l1_scale)
+    l1_scale_tm = nvfp4_scale_to_tile_major(l1_scale_il, block_n=block_n, block_k=block_k, group_size=group_size)
+    l2_scale_tm = nvfp4_scale_to_tile_major(l2_scale, block_n=block_n, block_k=block_k, group_size=group_size)
+    l1_packed_out = _braid_nvfp4_mode2_signs(nvfp4_fuse_packed_with_scale_tile_major(
+        l1_packed_il.contiguous(), l1_scale_tm, block_k=block_k)
+    )
+    l2_packed_out = _braid_nvfp4_mode2_signs(nvfp4_fuse_packed_with_scale_tile_major(
+        l2_packed.contiguous(), l2_scale_tm, block_k=block_k)
+    )
+    setattr(l1_packed_out, _SM90_NVFP4_H200_FUSED_LAYOUT_ATTR,
+            _SM90_NVFP4_H200_FUSED_LAYOUT)
+    setattr(l2_packed_out, _SM90_NVFP4_H200_FUSED_LAYOUT_ATTR,
+            _SM90_NVFP4_H200_FUSED_LAYOUT)
+    return (
+        l1_packed_out,
+        l1_scale_tm,
+    ), (
+        l2_packed_out,
+        l2_scale_tm,
+    )
 
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
