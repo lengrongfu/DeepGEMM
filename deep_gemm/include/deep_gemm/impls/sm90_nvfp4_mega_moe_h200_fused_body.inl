@@ -41,8 +41,15 @@
     // per-64 SF capacity; this per-128 path uses its first half
     // as a dense per-128 layout so no framework allocation change is needed.
     // =====================================================================
+    // NOTES: this kernel uses a static full pool (not the ring buffer other
+    // MMA kinds use), so `num_ring_tokens` is set to the full pool token
+    // count -- this must match what `get_symm_buffer_size_for_mega_moe`
+    // (host side) used for the same `mma_type="fp4xfp4"` SM90 buffer so that
+    // every downstream offset (expert counts, arrival counters, dispatch
+    // pulling, combine metadata) lines up with what was actually allocated.
     const auto workspace = layout::Workspace(
-        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
+        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk,
+        kNumMaxPoolTokens);
 
     constexpr auto fp8_token_layout              = layout::Data(kHidden);
     constexpr auto bf16_token_layout             = layout::Data(kHidden * sizeof(nv_bfloat16));

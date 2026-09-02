@@ -166,7 +166,7 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
         num_topk,
         hidden,
         intermediate_hidden,
-        use_fp8_dispatch=True,
+        mma_type="fp4xfp4",
         activation="swiglu",
     )
 

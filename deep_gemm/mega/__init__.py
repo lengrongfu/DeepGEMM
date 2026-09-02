@@ -253,6 +253,35 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         situ_beta, situ_linear_beta
     )
 
+
+def nvfp4_mega_moe(y: torch.Tensor,
+                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                  l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                  sym_buffer: SymmBuffer,
+                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                  l1_global_scales: Optional[torch.Tensor] = None,
+                  l2_global_scales: Optional[torch.Tensor] = None,
+                  activation_clamp: Optional[float] = None,
+                  fast_math: bool = True):
+    l1_layout = getattr(l1_weights[0], _SM90_NVFP4_H200_FUSED_LAYOUT_ATTR, None)
+    l2_layout = getattr(l2_weights[0], _SM90_NVFP4_H200_FUSED_LAYOUT_ATTR, None)
+    if l1_layout != _SM90_NVFP4_H200_FUSED_LAYOUT or l2_layout != l1_layout:
+        raise ValueError(
+            "NVFP4 weights must use the Mode2 Braided layout produced by "
+            "transform_nvfp4_weights_for_mega_moe_sm90"
+        )
+    _C.nvfp4_mega_moe(
+        y, l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        l1_global_scales, l2_global_scales,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        activation_clamp, fast_math,
+    )
+
+
 def fp4_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],

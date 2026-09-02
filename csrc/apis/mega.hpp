@@ -84,16 +84,6 @@ get_symm_buffer_size_for_mega_moe(
     // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
-    // Iterate all block candidates to get the maximum ring size
-    int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_sms, hidden, intermediate_hidden);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
-    }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
-
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto num_mma_elem_bits = get_num_mma_elem_bits(mma_kind);
@@ -105,6 +95,28 @@ get_symm_buffer_size_for_mega_moe(
     const auto is_sm90_nvfp4 = mma_kind == MmaKind::NVFP4 && device_runtime->get_arch_major() == 9;
     const auto sf_gran_k = is_sm90_nvfp4 ? 32u : get_mma_sf_gran_k(mma_kind);
     const auto l2_sf_gran_k = is_sm90_nvfp4 ? 16u : sf_gran_k;
+
+    // Iterate all block candidates to get the maximum ring size.
+    // NOTES: the SM90 fused NVFP4 kernel uses a static full pool (readiness
+    // tracked via `Workspace::get_l1_arrival_count_ptr`/`get_l2_arrival_mask_ptr`)
+    // instead of the ring buffer other MMA kinds use, so it needs the full
+    // (unreduced) pool token count here -- the device-side kernel reconstructs
+    // its own `Workspace` with this same value (see `kNumMaxPoolTokens` in the
+    // SM90 kernel body) so that every downstream offset stays consistent.
+    int num_ring_tokens = 0;
+    if (is_sm90_nvfp4) {
+        num_ring_tokens = static_cast<int>(layout::get_num_max_pool_tokens(
+            static_cast<uint32_t>(num_ranks), static_cast<uint32_t>(num_max_tokens_per_rank),
+            static_cast<uint32_t>(num_topk), static_cast<uint32_t>(num_experts_per_rank)));
+    } else {
+        for (const auto& block_m: layout::kCandidateBlockM) {
+            const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+            const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+                num_pool_blocks, num_sms, hidden, intermediate_hidden);
+            num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+        }
+        num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    }
 
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
@@ -119,11 +131,15 @@ get_symm_buffer_size_for_mega_moe(
     // All buffers
     // NOTES: NVFP4 shared experts run in BF16 (16-bit, SF-free)
     const auto shared_num_mma_elem_bits = mma_kind == MmaKind::NVFP4 ? 16 : 0;
+    // The SM90 fused NVFP4 MegaMoE kernel dispatches/consumes FP8 (E4M3, 8-bit)
+    // activations for x/L1/L2 -- only the weights (loaded directly from the
+    // caller-provided tensors, not through this dispatch buffer) are NVFP4-packed.
+    const auto dispatch_num_mma_elem_bits = is_sm90_nvfp4 ? 8u : num_mma_elem_bits;
     const auto mega_buffer = layout::MegaMoEBuffer(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts, num_mma_elem_bits, sf_gran_k,
+        num_shared_experts, dispatch_num_mma_elem_bits, sf_gran_k,
         shared_num_mma_elem_bits,
         l2_sf_gran_k, /* require_sf_tma_alignment */ not is_sm90_nvfp4
     );
@@ -143,7 +159,9 @@ get_symm_buffer_size_for_mega_moe(
     // NOTES: `x_sf` is K-major, while `l1_acts_sf` and `l2_acts_sf` are M-major
     // NOTES: for NVFP4, token views are packed E2M1 bytes (2 elements each) and SF
     // views pack 4 E4M3 bytes per `int`
-    const auto is_fp4 = mma_kind == MmaKind::NVFP4;
+    // NOTES: the SM90 fused NVFP4 kernel dispatches FP8 (not packed-FP4)
+    // activations for x/L1/L2 -- see `dispatch_num_mma_elem_bits` above.
+    const auto is_fp4 = mma_kind == MmaKind::NVFP4 && !is_sm90_nvfp4;
     const auto token_dtype = is_fp4 ? torch::kUInt8 : (with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16);
     const auto hidden_cols = is_fp4 ? hidden / 2 : hidden;
     const auto intermediate_cols = is_fp4 ? intermediate_hidden / 2 : intermediate_hidden;

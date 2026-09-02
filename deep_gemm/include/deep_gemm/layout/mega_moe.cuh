@@ -58,6 +58,10 @@ struct Workspace {
 
     // Full-pool span used by non-ring token metadata
     uint32_t num_max_pool_tokens;
+    // Full-pool block count, used by the SM90 fused NVFP4 kernel's per-block
+    // arrival-count/mask readiness tracking (that kernel uses a static full
+    // pool instead of the ring buffer above)
+    uint32_t num_max_pool_blocks;
 
     // Keep grid/NVLink/schedule counters separated from expert counters.
     // NVIDIA L2 cache lines are 128B, and these counters are hot atomics.
@@ -79,6 +83,7 @@ struct Workspace {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+        num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
         num_ring_blocks = num_ring_tokens / kMinCandidateBlockM;
         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
     }
@@ -116,6 +121,13 @@ struct Workspace {
 
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+
+        // SM90 fused NVFP4 kernel: full-pool L1 arrival count (padded to even
+        // entry count for `uint64_t` alignment of the L2 mask that follows)
+        // and L2 block arrival mask. Unused (but harmlessly allocated) by
+        // every other MMA kind / architecture.
+        num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
+        num_bytes += num_max_pool_blocks * sizeof(uint64_t);
 
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
@@ -237,6 +249,24 @@ struct Workspace {
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
+    }
+
+    // SM90 fused NVFP4 kernel: per-pool-block readiness tracking over the
+    // full (non-ring) pool. `get_l1_arrival_count_ptr` counts tokens written
+    // into an L1 pool block so the GEMM loader knows when it's fully ready;
+    // `get_l2_arrival_mask_ptr` is a bitmask (one bit per L1 N block) an L2
+    // consumer waits on before reading that pool block's L1 output.
+    CUTLASS_DEVICE
+    uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
+        const auto base = reinterpret_cast<uint32_t*>(get_token_src_metadata_ptr(num_max_pool_tokens));
+        return base + pool_block_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_l2_arrival_mask_ptr(const uint32_t& pool_block_idx = 0) const {
+        // Pad L1 entry count to even so the `l2_arrival_mask` is 8-byte aligned
+        const auto base = get_l1_arrival_count_ptr(math::align(num_max_pool_blocks, 2u));
+        return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
     }
 };
 

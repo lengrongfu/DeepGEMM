@@ -27,6 +27,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
+        mma_type="fp4xfp4",
     )
 
     # Inputs (bf16, then quantised)
