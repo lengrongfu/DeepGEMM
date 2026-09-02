@@ -27,7 +27,16 @@ struct SM90NVFP4H200FusedConfig {
 
 struct SM90NVFP4H200FusedShape {
     static constexpr int kH200NumSMs = 132;
-    static constexpr int kNumRanks = 8;
+    // Historical/default EP degree (kept only as documentation and as the
+    // kernel template default -- see `sm90_nvfp4_mega_moe_h200_fused_impl`'s
+    // `kNumRanks`/`kNumExperts` template params). Not enforced below: this
+    // kernel's expert routing, mailbox scheduler, and NVLink barrier are all
+    // generic in the rank count (no power-of-2 or ==8-specific arithmetic),
+    // so any `num_ranks` that fits `layout::kNumMaxRanks` (72) works, as
+    // long as `num_experts == kExpertsPerRank * num_ranks` still holds --
+    // `kExpertsPerRank` (experts hosted locally per rank) is the real,
+    // rank-count-independent model/tuning constant this kernel is built for.
+    static constexpr int kDefaultNumRanks = 8;
     static constexpr int kExpertsPerRank = 48;
     static constexpr int kTopk = 8;
     static constexpr int kHidden = 6144;
@@ -46,8 +55,8 @@ struct SM90NVFP4H200FusedShape {
 
     constexpr bool is_supported_h200_shape() const noexcept {
         return num_sms == kH200NumSMs &&
-            num_ranks == kNumRanks &&
-            num_experts == kExpertsPerRank * kNumRanks &&
+            num_ranks > 0 && num_ranks <= 72 /* layout::kNumMaxRanks */ &&
+            num_experts == kExpertsPerRank * num_ranks &&
             num_topk == kTopk &&
             hidden == kHidden &&
             intermediate_hidden == kIntermediateHidden;

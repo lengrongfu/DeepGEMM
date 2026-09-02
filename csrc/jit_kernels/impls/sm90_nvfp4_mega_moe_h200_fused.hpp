@@ -19,6 +19,8 @@ class SM90NVFP4H200FusedRuntime final
     : public LaunchRuntime<SM90NVFP4H200FusedRuntime> {
 public:
     struct Args {
+        int num_ranks;
+        int num_experts;
         int num_max_tokens_per_rank;
         float activation_clamp;
         bool fast_math;
@@ -74,7 +76,9 @@ static void __instantiate_kernel() {{
         /* kNumStages */ {},
         /* kActivationClamp */ {},
         /* kFastMath */ {},
-        {}
+        {},
+        /* kNumRanks */ {},
+        /* kNumExperts */ {}
     >);
 }};
 )",
@@ -89,7 +93,9 @@ static void __instantiate_kernel() {{
             args.config.num_stages,
             to_string(args.activation_clamp),
             args.fast_math ? "true" : "false",
-            policy_template_args);
+            policy_template_args,
+            args.num_ranks,
+            args.num_experts);
     }
 
     static void launch_impl(
@@ -190,6 +196,8 @@ static void sm90_nvfp4_h200_fused_mega_moe(
         l2_global_scales->data_ptr<float>() : nullptr;
 
     const SM90NVFP4H200FusedRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,

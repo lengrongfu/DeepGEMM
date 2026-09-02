@@ -295,14 +295,22 @@ template <
     bool kSwapABRequested,
     bool kSingleActiveDispatchWarp,
     bool kUseMode2RowDecoder,
-    bool kUseInterleavedScheduler
+    bool kUseInterleavedScheduler,
+    // Number of EP ranks and total routed experts. Defaulted to the H200
+    // MiMo values (8, 384) for backward compatibility; any (kNumRanks,
+    // kNumExperts) pair with kNumExperts % kNumRanks == 0 and
+    // kNumExperts / kNumRanks == SM90NVFP4H200FusedShape::kExpertsPerRank
+    // (48) is structurally supported -- nothing in this kernel's expert
+    // routing, mailbox scheduler, or NVLink barrier assumes exactly 8 ranks.
+    uint32_t kNumRanks = 8,
+    uint32_t kNumExperts = 384
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
         void* y,
         int* cumulative_local_expert_recv_stats,
         const uint32_t num_tokens,
-        const __grid_constant__ layout::SymBuffer<8> sym_buffer,
+        const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -314,14 +322,12 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         const float* __restrict__ l2_global_scales) {
     constexpr uint32_t kHidden = 6144;
     constexpr uint32_t kIntermediateHidden = 2048;
-    constexpr uint32_t kNumExperts = 384;
     constexpr uint32_t kNumTopk = 8;
     constexpr uint32_t BLOCK_K = 128;
     constexpr uint32_t kNumDispatchThreads = 64;
     constexpr uint32_t kNumNonEpilogueThreads = 64;
     constexpr uint32_t kNumEpilogueThreads = 256;
     constexpr uint32_t kNumSMs = 132;
-    constexpr uint32_t kNumRanks = 8;
     constexpr uint32_t L1_SHAPE_N = kIntermediateHidden * 2;
     constexpr uint32_t L1_SHAPE_K = kHidden;
     constexpr uint32_t L2_SHAPE_N = kHidden;
