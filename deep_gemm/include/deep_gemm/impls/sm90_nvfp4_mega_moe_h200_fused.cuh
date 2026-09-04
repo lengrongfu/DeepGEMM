@@ -284,7 +284,6 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_braided_lut_window(
 
 template <
     uint32_t kNumMaxTokensPerRank,
-    uint32_t kNumExpertsPerWave,
     uint32_t BLOCK_M,
     uint32_t BLOCK_N,
     uint32_t kNumMaxPoolTokens,
@@ -296,14 +295,9 @@ template <
     bool kSingleActiveDispatchWarp,
     bool kUseMode2RowDecoder,
     bool kUseInterleavedScheduler,
-    // Number of EP ranks and total routed experts. Defaulted to the H200
-    // MiMo values (8, 384) for backward compatibility; any (kNumRanks,
-    // kNumExperts) pair with kNumExperts % kNumRanks == 0 and
-    // kNumExperts / kNumRanks == SM90NVFP4H200FusedShape::kExpertsPerRank
-    // (48) is structurally supported -- nothing in this kernel's expert
-    // routing, mailbox scheduler, or NVLink barrier assumes exactly 8 ranks.
-    uint32_t kNumRanks = 8,
-    uint32_t kNumExperts = 384
+    uint32_t kNumSMs,
+    uint32_t kNumRanks,
+    uint32_t kNumExperts
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
@@ -327,7 +321,6 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
     constexpr uint32_t kNumDispatchThreads = 64;
     constexpr uint32_t kNumNonEpilogueThreads = 64;
     constexpr uint32_t kNumEpilogueThreads = 256;
-    constexpr uint32_t kNumSMs = 132;
     constexpr uint32_t L1_SHAPE_N = kIntermediateHidden * 2;
     constexpr uint32_t L1_SHAPE_K = kHidden;
     constexpr uint32_t L2_SHAPE_N = kHidden;

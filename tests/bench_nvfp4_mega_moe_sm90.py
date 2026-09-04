@@ -152,7 +152,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         batches = args.batches
 
     dist_print(
-        f'H200 NVFP4 MegaMoE bench: ranks={num_ranks} hidden={args.hidden} '
+        f'SM90 NVFP4 MegaMoE bench: ranks={num_ranks} hidden={args.hidden} '
         f'ih={args.intermediate_hidden} experts={args.num_experts} topk={args.num_topk} '
         f'masked_ratio={args.masked_ratio} fast_math={bool(args.fast_math)}',
         once_in_node=True,
@@ -184,7 +184,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='H200 NVFP4 MegaMoE benchmark')
+    parser = argparse.ArgumentParser(description='SM90 NVFP4 MegaMoE benchmark')
 
     parser.add_argument('--ncu-profile-only', action='store_true')
     parser.add_argument('--num-processes', type=int, default=8)
@@ -194,7 +194,7 @@ if __name__ == '__main__':
                         help='List of num_tokens to sweep (default: 8 16 32 64 128)')
     parser.add_argument('--hidden', type=int, default=6144)
     parser.add_argument('--intermediate-hidden', type=int, default=2048)
-    parser.add_argument('--num-experts', type=int, default=384)
+    parser.add_argument('--num-experts', type=int, default=256)
     parser.add_argument('--num-topk', type=int, default=8)
     parser.add_argument('--activation-clamp', type=float, default=10.0)
     parser.add_argument('--masked-ratio', type=float, default=0.0)

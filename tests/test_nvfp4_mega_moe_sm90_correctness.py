@@ -129,6 +129,41 @@ def _silu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
+def _quantize_expert_chunks(
+    weight: torch.Tensor, chunk_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_experts, n, k = weight.shape
+    packed = torch.empty(
+        (num_experts, n, k // 2), dtype=torch.uint8, device=weight.device
+    )
+    scales = torch.empty(
+        (num_experts, n, k // 16), dtype=torch.uint8, device=weight.device
+    )
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        packed[start:end], scales[start:end] = quantize_to_nvfp4(
+            weight[start:end], group_size=16
+        )
+    return packed, scales
+
+
+def _dequantize_expert_chunks(
+    packed: torch.Tensor, scales: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    num_experts, n, packed_k = packed.shape
+    output = torch.empty(
+        (num_experts, n, packed_k * 2),
+        dtype=torch.float32,
+        device=packed.device,
+    )
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        output[start:end] = dequantize_nvfp4_to_fp32(
+            packed[start:end], scales[start:end], group_size=16
+        )
+    return output
+
+
 def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
               global_scale_mode: str,
               rank_idx: int, group: dist.ProcessGroup) -> None:
@@ -142,6 +177,12 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
     num_experts = args.num_experts
     num_topk = args.num_topk
     num_ranks = dist.get_world_size(group)
+    if args.expert_chunk_size <= 0:
+        raise ValueError("expert_chunk_size must be positive")
+    if num_experts % num_ranks != 0:
+        raise ValueError(
+            f"num_experts={num_experts} must be divisible by num_ranks={num_ranks}"
+        )
     num_local_experts = num_experts // num_ranks
     num_max_tokens_per_rank = args.num_max_tokens_per_rank or max(32, m_tokens)
     if num_max_tokens_per_rank < m_tokens:
@@ -186,10 +227,18 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
 
     x_fp8, x_sf = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128)
 
-    l1_packed, l1_scale = quantize_to_nvfp4(l1_bf, group_size=16)
-    l2_packed, l2_scale = quantize_to_nvfp4(l2_bf, group_size=16)
-    l1_dequant = dequantize_nvfp4_to_fp32(l1_packed, l1_scale, group_size=16)
-    l2_dequant = dequantize_nvfp4_to_fp32(l2_packed, l2_scale, group_size=16)
+    l1_packed, l1_scale = _quantize_expert_chunks(
+        l1_bf, args.expert_chunk_size
+    )
+    l2_packed, l2_scale = _quantize_expert_chunks(
+        l2_bf, args.expert_chunk_size
+    )
+    l1_dequant = _dequantize_expert_chunks(
+        l1_packed, l1_scale, args.expert_chunk_size
+    )
+    l2_dequant = _dequantize_expert_chunks(
+        l2_packed, l2_scale, args.expert_chunk_size
+    )
 
     transformed_l1, transformed_l2 = deep_gemm.transform_nvfp4_weights_for_mega_moe_sm90(
         (l1_packed, l1_scale), (l2_packed, l2_scale),
@@ -349,14 +398,15 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="H200 NVFP4 MegaMoE correctness gate")
+    parser = argparse.ArgumentParser(description="SM90 NVFP4 MegaMoE correctness gate")
     parser.add_argument("--batches", nargs="+", type=int, default=[8, 16, 32, 64, 128])
     parser.add_argument("--hidden", type=int, default=6144)
     parser.add_argument("--intermediate-hidden", type=int, default=2048)
-    parser.add_argument("--num-experts", type=int, default=384)
+    parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--num-topk", type=int, default=8)
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=8192)
     parser.add_argument("--num-processes", type=int, default=8)
+    parser.add_argument("--expert-chunk-size", type=int, default=8)
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)

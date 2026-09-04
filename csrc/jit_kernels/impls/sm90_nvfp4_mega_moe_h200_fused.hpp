@@ -68,7 +68,6 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&{}<
         /* kNumMaxTokensPerRank */ {},
-        /* kNumExpertsPerWave */ {},
         /* BLOCK_M */ {},
         /* BLOCK_N */ {},
         /* kNumMaxPoolTokens */ {},
@@ -77,6 +76,7 @@ static void __instantiate_kernel() {{
         /* kActivationClamp */ {},
         /* kFastMath */ {},
         {},
+        /* kNumSMs */ {},
         /* kNumRanks */ {},
         /* kNumExperts */ {}
     >);
@@ -85,7 +85,6 @@ static void __instantiate_kernel() {{
             kernel_header,
             "sm90_nvfp4_mega_moe_h200_fused_impl",
             args.num_max_tokens_per_rank,
-            args.config.num_experts_per_wave,
             args.config.block_m,
             args.config.block_n,
             args.config.num_max_pool_tokens,
@@ -94,6 +93,7 @@ static void __instantiate_kernel() {{
             to_string(args.activation_clamp),
             args.fast_math ? "true" : "false",
             policy_template_args,
+            args.launch_args.grid_dim.first,
             args.num_ranks,
             args.num_experts);
     }
@@ -147,7 +147,6 @@ static void sm90_nvfp4_h200_fused_mega_moe(
     const auto plan = select_sm90_nvfp4_h200_fused(heuristic_input);
     const auto& config = plan.config;
     using KernelConfig = SM90NVFP4H200FusedConfig;
-    DG_HOST_ASSERT(num_experts_per_rank % config.num_experts_per_wave == 0);
     DG_HOST_ASSERT((config.block_m == 8 || config.block_m == 16 ||
                     config.block_m == 24 || config.block_m == 64 ||
                     config.block_m == 128));

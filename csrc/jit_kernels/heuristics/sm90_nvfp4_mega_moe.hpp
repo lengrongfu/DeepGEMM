@@ -21,23 +21,14 @@ struct SM90NVFP4H200FusedConfig {
     int block_m, block_n;
     int num_max_pool_tokens;
     int num_padded_sf_pool_tokens;
-    int num_experts_per_wave;
     int num_stages, smem_size;
 };
 
 struct SM90NVFP4H200FusedShape {
-    static constexpr int kH200NumSMs = 132;
-    // Historical/default EP degree (kept only as documentation and as the
-    // kernel template default -- see `sm90_nvfp4_mega_moe_h200_fused_impl`'s
-    // `kNumRanks`/`kNumExperts` template params). Not enforced below: this
-    // kernel's expert routing, mailbox scheduler, and NVLink barrier are all
-    // generic in the rank count (no power-of-2 or ==8-specific arithmetic),
-    // so any `num_ranks` that fits `layout::kNumMaxRanks` (72) works, as
-    // long as `num_experts == kExpertsPerRank * num_ranks` still holds --
-    // `kExpertsPerRank` (experts hosted locally per rank) is the real,
-    // rank-count-independent model/tuning constant this kernel is built for.
-    static constexpr int kDefaultNumRanks = 8;
-    static constexpr int kExpertsPerRank = 48;
+    static constexpr int kMaxNumRanks = 72;
+    // The expert-count SMEM slice has the same aligned size as the original
+    // 384-expert tuning through 512 experts.
+    static constexpr int kMaxNumExperts = 512;
     static constexpr int kTopk = 8;
     static constexpr int kHidden = 6144;
     static constexpr int kIntermediateHidden = 2048;
@@ -53,10 +44,11 @@ struct SM90NVFP4H200FusedShape {
         return num_tokens > 0;
     }
 
-    constexpr bool is_supported_h200_shape() const noexcept {
-        return num_sms == kH200NumSMs &&
-            num_ranks > 0 && num_ranks <= 72 /* layout::kNumMaxRanks */ &&
-            num_experts == kExpertsPerRank * num_ranks &&
+    constexpr bool is_supported_sm90_shape() const noexcept {
+        return num_sms > 1 &&
+            num_ranks > 0 && num_ranks <= kMaxNumRanks &&
+            num_experts >= kTopk && num_experts <= kMaxNumExperts &&
+            num_experts % num_ranks == 0 &&
             num_topk == kTopk &&
             hidden == kHidden &&
             intermediate_hidden == kIntermediateHidden;
@@ -88,10 +80,8 @@ struct SM90NVFP4H200FusedPlan {
 static SM90NVFP4H200FusedPlan
 select_sm90_nvfp4_h200_fused(
         const SM90NVFP4H200FusedInput& input) {
-    DG_HOST_ASSERT(input.shape().is_supported_h200_shape());
-    DG_HOST_ASSERT(
-        input.num_experts_per_rank ==
-        SM90NVFP4H200FusedShape::kExpertsPerRank);
+    DG_HOST_ASSERT(input.shape().is_supported_sm90_shape());
+    DG_HOST_ASSERT(input.num_experts_per_rank > 0);
     DG_HOST_ASSERT(input.num_experts ==
                    input.num_experts_per_rank * input.num_ranks);
     DG_HOST_ASSERT(input.num_max_tokens_per_rank > 0);
@@ -102,7 +92,6 @@ select_sm90_nvfp4_h200_fused(
 
     struct Tuning {
         int block_m, block_n;
-        int num_experts_per_wave;
         int num_stages;
         int smem_size;
         bool swap_ab;
@@ -111,29 +100,27 @@ select_sm90_nvfp4_h200_fused(
     } tuning {};
 
     if (input.num_tokens <= 1)
-        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 4, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 8)
-        tuning = {8, 256, 16, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 4, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 16)
-        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 4, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 32)
-        tuning = {16, 256, 48, 3, SM90ArchSpec::smem_capacity,
+        tuning = {16, 256, 3, SM90ArchSpec::smem_capacity,
                   true, true, false};
     else if (input.num_tokens <= 64)
-        tuning = {24, 256, 48, 3, 229312,
+        tuning = {24, 256, 3, 229312,
                   true, false, true};
     else if (input.num_tokens <= 256)
-        tuning = {64, 256, 48, 3, 209856,
+        tuning = {64, 256, 3, 209856,
                   false, true, false};
     else
-        tuning = {128, 128, 48, 6, SM90ArchSpec::smem_capacity,
+        tuning = {128, 128, 6, SM90ArchSpec::smem_capacity,
                   false, true, false};
 
-    DG_HOST_ASSERT(
-        input.num_experts_per_rank % tuning.num_experts_per_wave == 0);
     DG_HOST_ASSERT(tuning.smem_size <= SM90ArchSpec::smem_capacity);
     return {
         {
@@ -143,7 +130,6 @@ select_sm90_nvfp4_h200_fused(
                 input.num_ranks, input.num_max_tokens_per_rank,
                 input.num_topk, input.num_experts_per_rank),
             input.num_padded_sf_pool_tokens,
-            tuning.num_experts_per_wave,
             tuning.num_stages,
             cute::min(tuning.smem_size +
                           layout::kSM90InterleavedSchedulerSMEMBytes,

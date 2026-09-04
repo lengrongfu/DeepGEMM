@@ -393,8 +393,8 @@ static void fp8_fp4_mega_moe(
         sym_buffer.zero_();
 }
 
-// SM90 fused NVFP4 MegaMoE: routed-only (no shared experts), single fixed
-// H200 shape (see `SM90NVFP4H200FusedShape::is_supported_h200_shape`).
+// SM90 fused NVFP4 MegaMoE: routed-only (no shared experts), with a fixed
+// compute shape and dynamically specialized SM/expert-parallel topology.
 static void nvfp4_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
@@ -467,7 +467,7 @@ static void nvfp4_mega_moe(
     const SM90NVFP4H200FusedShape shape = {
         device_runtime->get_num_sms(), num_ranks, num_experts, num_topk,
         hidden, intermediate_hidden};
-    DG_HOST_ASSERT(shape.is_supported_h200_shape());
+    DG_HOST_ASSERT(shape.is_supported_sm90_shape());
     DG_HOST_ASSERT(SM90NVFP4H200FusedShape::is_supported_batch(num_tokens));
     DG_HOST_ASSERT(rank_idx >= 0 && rank_idx < num_ranks);
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(

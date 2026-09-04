@@ -5,6 +5,13 @@
     // =====================================================================
     // Template checks
     // =====================================================================
+    DG_STATIC_ASSERT(kNumSMs > 1, "SM90 MegaMoE requires multiple SMs");
+    DG_STATIC_ASSERT(kNumRanks > 0 && kNumRanks <= 72,
+                     "Invalid number of EP ranks");
+    DG_STATIC_ASSERT(kNumExperts >= kNumTopk && kNumExperts <= 512,
+                     "Invalid number of routed experts");
+    DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0,
+                     "Routed experts must be divisible by EP ranks");
     DG_STATIC_ASSERT(BLOCK_M == 8 || BLOCK_M == 16 ||
                      BLOCK_M == 24 || BLOCK_M == 64 || BLOCK_M == 128,
                      "H200 fused kernel requires BM8/BM16/BM24/BM64/BM128");
