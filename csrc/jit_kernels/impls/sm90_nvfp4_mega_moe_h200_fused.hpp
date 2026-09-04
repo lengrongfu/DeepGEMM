@@ -70,7 +70,7 @@ static void __instantiate_kernel() {{
         /* kNumMaxTokensPerRank */ {},
         /* BLOCK_M */ {},
         /* BLOCK_N */ {},
-        /* kNumMaxPoolTokens */ {},
+        /* kNumRingTokens */ {},
         /* kNumPaddedSFPoolTokens */ {},
         /* kNumStages */ {},
         /* kActivationClamp */ {},
@@ -87,7 +87,7 @@ static void __instantiate_kernel() {{
             args.num_max_tokens_per_rank,
             args.config.block_m,
             args.config.block_n,
-            args.config.num_max_pool_tokens,
+            args.config.num_ring_tokens,
             args.config.num_padded_sf_pool_tokens,
             args.config.num_stages,
             to_string(args.activation_clamp),
@@ -156,7 +156,7 @@ static void sm90_nvfp4_h200_fused_mega_moe(
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = config.block_n / 2;
     const auto tensor_map_l1_acts = make_tma_2d_desc(
-        l1_acts, hidden, config.num_max_pool_tokens,
+        l1_acts, hidden, config.num_ring_tokens,
         KernelConfig::kBlockK, config.block_m,
         static_cast<int>(l1_acts.stride(-2)), KernelConfig::kSwizzleActsMode);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(
@@ -171,11 +171,11 @@ static void sm90_nvfp4_h200_fused_mega_moe(
 
     const int l1_output_store_block_n = config.block_n / 2;
     const auto tensor_map_l1_output = make_tma_2d_desc(
-        l2_acts, intermediate_hidden, config.num_max_pool_tokens,
+        l2_acts, intermediate_hidden, config.num_ring_tokens,
         l1_output_store_block_n, config.block_m,
         static_cast<int>(l2_acts.stride(-2)), 0);
     const auto tensor_map_l2_acts = make_tma_2d_desc(
-        l2_acts, intermediate_hidden, config.num_max_pool_tokens,
+        l2_acts, intermediate_hidden, config.num_ring_tokens,
         KernelConfig::kBlockK, config.block_m,
         static_cast<int>(l2_acts.stride(-2)), KernelConfig::kSwizzleActsMode);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(

@@ -286,7 +286,7 @@ template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t BLOCK_M,
     uint32_t BLOCK_N,
-    uint32_t kNumMaxPoolTokens,
+    uint32_t kNumRingTokens,
     uint32_t kNumPaddedSFPoolTokens,
     uint32_t kNumStages,
     float kActivationClamp,
@@ -331,6 +331,7 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
     constexpr uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4;
     constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
     constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+    constexpr uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M;
 #include <deep_gemm/impls/sm90_nvfp4_mega_moe_h200_fused_body.inl>
 }
 

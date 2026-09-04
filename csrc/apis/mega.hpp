@@ -115,17 +115,16 @@ get_symm_buffer_size_for_mega_moe(
     const auto l2_sf_gran_k = is_sm90_nvfp4 ? (kSM90MinL2ActsSFBlockN / 2u) / 4u : sf_gran_k;
 
     // Iterate all block candidates to get the maximum ring size.
-    // NOTES: the SM90 fused NVFP4 kernel uses a static full pool (readiness
-    // tracked via `Workspace::get_l1_arrival_count_ptr`/`get_l2_arrival_mask_ptr`)
-    // instead of the ring buffer other MMA kinds use, so it needs the full
-    // (unreduced) pool token count here -- the device-side kernel reconstructs
-    // its own `Workspace` with this same value (see `kNumMaxPoolTokens` in the
-    // SM90 kernel body) so that every downstream offset stays consistent.
+    // NOTES: the SM90 fused NVFP4 kernel now reuses the same live-ring-buffer
+    // scheme as every other MMA kind (see `SM90NVFP4H200FusedShape::get_num_ring_tokens`,
+    // which mirrors this loop but iterates that kernel's own BLOCK_M candidates
+    // {8, 16, 24, 64, 128} instead of the generic `layout::kCandidateBlockM`
+    // set below, which omits 24) -- both sites call a single function so they
+    // cannot silently drift apart.
     int num_ring_tokens = 0;
     if (is_sm90_nvfp4) {
-        num_ring_tokens = static_cast<int>(layout::get_num_max_pool_tokens(
-            static_cast<uint32_t>(num_ranks), static_cast<uint32_t>(num_max_tokens_per_rank),
-            static_cast<uint32_t>(num_topk), static_cast<uint32_t>(num_experts_per_rank)));
+        num_ring_tokens = SM90NVFP4H200FusedShape::get_num_ring_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank, num_sms);
     } else {
         for (const auto& block_m: layout::kCandidateBlockM) {
             const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;

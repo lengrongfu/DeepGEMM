@@ -48,15 +48,17 @@
     // per-64 SF capacity; this per-128 path uses its first half
     // as a dense per-128 layout so no framework allocation change is needed.
     // =====================================================================
-    // NOTES: this kernel uses a static full pool (not the ring buffer other
-    // MMA kinds use), so `num_ring_tokens` is set to the full pool token
-    // count -- this must match what `get_symm_buffer_size_for_mega_moe`
-    // (host side) used for the same `mma_type="fp4xfp4"` SM90 buffer so that
-    // every downstream offset (expert counts, arrival counters, dispatch
-    // pulling, combine metadata) lines up with what was actually allocated.
+    // NOTES: this kernel reuses the same live ring buffer other MMA kinds
+    // use for L1/L2 activations -- `kNumRingTokens` must match what
+    // `get_symm_buffer_size_for_mega_moe` (host side) used for the same
+    // `mma_type="fp4xfp4"` SM90 buffer (see
+    // `SM90NVFP4H200FusedShape::get_num_ring_tokens`) so that every
+    // downstream offset (ring slot counters, dispatch pulling) lines up
+    // with what was actually allocated. Combine metadata still spans the
+    // full (non-ring) pool -- see `workspace.get_token_src_metadata_ptr`.
     const auto workspace = layout::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk,
-        kNumMaxPoolTokens);
+        kNumRingTokens);
 
     constexpr auto fp8_token_layout              = layout::Data(kHidden);
     constexpr auto bf16_token_layout             = layout::Data(kHidden * sizeof(nv_bfloat16));
@@ -76,12 +78,12 @@
     const auto input_topk_weights_buffer = layout::Buffer(input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
 
     // L1 input area
-    const auto l1_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, input_topk_weights_buffer.get_end_ptr());
+    const auto l1_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumRingTokens, input_topk_weights_buffer.get_end_ptr());
     const auto l1_sf_buffer           = layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
-    const auto l1_topk_weights_buffer = layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
+    const auto l1_topk_weights_buffer = layout::Buffer(l1_topk_weights_layout, 1, kNumRingTokens, l1_sf_buffer.get_end_ptr());
 
     // L2 input area
-    const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens, l1_topk_weights_buffer.get_end_ptr());
+    const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumRingTokens, l1_topk_weights_buffer.get_end_ptr());
     const auto l2_sf_buffer    = layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens, l2_token_buffer.get_end_ptr());
 
     // Combine input area
@@ -99,6 +101,7 @@
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumSMs, kNumRanks>;
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / BLOCK_N;
+    constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / BLOCK_N;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -424,8 +427,10 @@
                 __syncwarp();
 
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-                    *workspace.get_l1_arrival_count_ptr(cleanup_pool_block_offset + j) = 0;
-                    *workspace.get_l2_arrival_mask_ptr(cleanup_pool_block_offset + j) = 0;
+                    *workspace.get_l1_full_count_ptr((cleanup_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    *workspace.get_l1_empty_count_ptr((cleanup_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    *workspace.get_l2_full_count_ptr((cleanup_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    *workspace.get_l2_empty_count_ptr((cleanup_pool_block_offset + j) % kNumRingBlocks) = 0;
                 }
                 __syncwarp();
             }
@@ -638,13 +643,34 @@
                     input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                     current_rank_in_expert_idx);
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
+                // `pool_token_idx` stays absolute for the full-pool combine
+                // metadata below; `ring_token_idx` (its flat reduction mod
+                // `kNumRingTokens`) addresses the ring-buffered L1 token/SF/
+                // weight storage. Since `kNumRingTokens` is `BLOCK_M`-divisible
+                // (host side aligns it to the LCM of every candidate BLOCK_M),
+                // `ring_token_idx == ring_block_idx * BLOCK_M + token_in_block`
+                // exactly, so no separate block/offset split is needed here.
+                const uint32_t pool_block_idx =
+                    expert_pool_block_offset + token_idx_in_expert / BLOCK_M;
+                const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
                 const uint32_t pool_token_idx =
                     expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                const uint32_t ring_token_idx = pool_token_idx % kNumRingTokens;
+
+                // Wait for the ring slot to be free: the previous lap's L1
+                // GEMM-epilogue consumers must have fully vacated it before
+                // this lap's tokens may overwrite it.
+                const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumRoutedL1BlockNs;
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(ring_block_idx);
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target) {}
+                }
+
                 #pragma unroll
                 for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     if (j < kNumSFFloats)
-                        local_sf_ptr[j * kNumPaddedSFPoolTokens + pool_token_idx] = remote_sf_ptr[j];
+                        local_sf_ptr[j * kNumPaddedSFPoolTokens + ring_token_idx] = remote_sf_ptr[j];
                 }
                 __syncwarp();
 
@@ -652,13 +678,13 @@
                     const auto weight = *sym_buffer.map(
                         input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                         current_rank_in_expert_idx);
-                    *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
+                    *l1_topk_weights_buffer.get_data_buffer(ring_token_idx).get_base_ptr<float>() = weight;
 
                     ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
                     ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
                     ptx::tma_store_1d(
-                        l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
+                        l1_token_buffer.get_data_buffer(ring_token_idx).get_base_ptr(),
                         pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
 
                     *workspace.get_token_src_metadata_ptr(pool_token_idx) =
@@ -666,10 +692,17 @@
 
                     cute::tma_store_arrive();
                     ptx::tma_store_wait<0>();
+                    // Pad the last token in a block to a constant BLOCK_M per
+                    // block, so the lap-scaled full-count target the readers
+                    // wait on (`BLOCK_M * (lap + 1)`) is independent of any
+                    // block's actual `valid_m` -- required because different
+                    // laps through the same ring slot can have different
+                    // `valid_m`, unlike a static full pool where each slot is
+                    // only ever visited once.
+                    const bool is_last_token = (token_idx == expert_end_idx - 1);
                     ptx::red_add_rel(
-                        workspace.get_l1_arrival_count_ptr(
-                            expert_pool_block_offset + token_idx_in_expert / BLOCK_M),
-                        1u);
+                        workspace.get_l1_full_count_ptr(ring_block_idx),
+                        is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u);
                 }
                 __syncwarp();
             }
@@ -706,17 +739,24 @@
                 &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
 
             const bool has_valid_m = valid_m > 0;
+            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
 
-            // Wait for the pool to be ready.
+            // Wait for the ring slot to be ready: a lap-scaled target on a
+            // monotonic count (never reset mid-kernel), matching every other
+            // MMA kind's ring scheme. L1's writer pads its per-token count to
+            // a constant BLOCK_M per block (see the dispatch loop) so this
+            // target is lap-invariant regardless of any block's actual
+            // `valid_m`; L2's writer increments once per (pool_block, n_block)
+            // in `notify_l1_ready`, so `kNumRoutedL1BlockNs` per lap is exact.
             if (has_valid_m) {
                 if constexpr (!kBlockIsL2) {
-                    const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                    while (ptx::ld_acq(ptr) != valid_m) {}
+                    const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
+                    const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
+                    while (ptx::ld_acq(ptr) != num_expected_tokens) {}
                 } else {
-                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    const uint64_t expected = (kNumRoutedL1BlockNs >= 64)
-                        ? ~0ull : ((1ull << kNumRoutedL1BlockNs) - 1ull);
-                    while (ptx::ld_acq_gpu(ptr) != expected) {}
+                    const auto ptr = workspace.get_l2_full_count_ptr(ring_block_idx);
+                    const auto num_expected_blocks = kNumRoutedL1BlockNs * (pool_block_idx / kNumRingBlocks + 1);
+                    while (ptx::ld_acq(ptr) != num_expected_blocks) {}
                 }
             }
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -724,7 +764,7 @@
 
                 if (cute::elect_one_sync()) {
                     if (has_valid_m) {
-                        const uint32_t m_idx = pool_block_idx * BLOCK_M;
+                        const uint32_t m_idx = ring_block_idx * BLOCK_M;
                         const uint32_t k_idx = k_block_idx * BLOCK_K;
 
                         // TMA load A
@@ -817,12 +857,16 @@
                 empty_barriers[s]->arrive();
         };
 
-        const auto notify_l1_ready = [&](const uint32_t& ready_pool_block_idx,
-                                         const uint32_t& ready_n_block_idx) {
+        // Signals that this ring slot's L1 output (this task's N block) is
+        // ready for L2 to consume (`l2_full_count`), and that the L1 input
+        // buffers this task read from are no longer needed, so a future lap
+        // may overwrite this ring slot (`l1_empty_count`).
+        const auto notify_l1_ready = [&](const uint32_t& ready_ring_block_idx) {
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                ptx::red_or_rel_gpu(
-                    workspace.get_l2_arrival_mask_ptr(ready_pool_block_idx),
-                    1ull << ready_n_block_idx);
+                ptx::red_add_rel(
+                    workspace.get_l2_full_count_ptr(ready_ring_block_idx), 1u);
+                ptx::red_add(
+                    workspace.get_l1_empty_count_ptr(ready_ring_block_idx), 1u);
             }
             __syncwarp();
         };
@@ -846,7 +890,14 @@
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx,
                                      const uint32_t& pool_block_idx,
                                      const uint32_t& valid_m) {
-            const uint32_t m_idx = pool_block_idx * BLOCK_M;
+            // NOTES: `m_idx` (ring-slot-relative) addresses this task's L1
+            // input (`l1_topk_weights_buffer`) and L1-output/L2-input
+            // (`l2_token_buffer`, `l2_sf_buffer`) -- all ring buffers. The L2
+            // branch's own combine-metadata addressing uses the raw absolute
+            // `pool_block_idx * BLOCK_M` directly (full, non-ring pool), not
+            // this variable -- see below.
+            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t m_idx = ring_block_idx * BLOCK_M;
             const uint32_t wg_n_idx =
                 kSplitMDecodedWeightReuse ? 0u : epilogue_wg_idx * WG_BLOCK_N;
             const uint32_t wg_l1_out_n_idx =
@@ -1185,6 +1236,15 @@
             }
 
             if constexpr (!kBlockIsL2) {
+                // Wait for the ring slot's previous-lap L2 consumers to have
+                // fully vacated `l2_token_buffer`/`l2_sf_buffer` before this
+                // lap's L1 epilogue overwrites them (see the matching
+                // `l2_empty_count` increment in the L2 branch below).
+                {
+                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                    const auto num_expected_blocks = kNumRoutedL2BlockNs * (pool_block_idx / kNumRingBlocks);
+                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks) {}
+                }
                 const float l1_global_scale = l1_global_scales == nullptr ? 1.0f : __ldg(l1_global_scales + local_expert_idx);
                 if constexpr (kSwapABRequested) {
                     auto silu = [](float x) -> float {
@@ -1331,7 +1391,7 @@
                     __syncwarp();
                     ptx::tma_store_wait<0>();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    notify_l1_ready(pool_block_idx, n_block_idx);
+                    notify_l1_ready(ring_block_idx);
                 } else {
                     // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
                     const bool valid_r0 = row_offset_r0 < valid_m;
@@ -1524,10 +1584,19 @@
                     __syncwarp();
                     ptx::tma_store_wait<0>();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    notify_l1_ready(pool_block_idx, n_block_idx);
+                    notify_l1_ready(ring_block_idx);
                 }
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
+                // This task's GEMM load (`load_a_task`/`load_b_task`, a
+                // different warp) has already finished reading `l2_token_buffer`
+                // /`l2_sf_buffer` for this ring slot by construction (the GEMM
+                // accumulate above depends on that load). Signal the slot free
+                // for a future lap's L1 epilogue to overwrite.
+                if (epilogue_warp_idx == 0 and cute::elect_one_sync())
+                    ptx::red_add(workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
+                __syncwarp();
+
                 if constexpr (kSwapABRequested) {
                     // Each active warp scatters a contiguous group of up to 16 rows.
                     constexpr uint32_t kNumRowsPerWarp =

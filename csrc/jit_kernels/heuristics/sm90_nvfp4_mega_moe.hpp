@@ -1,8 +1,12 @@
 #pragma once
 
+#include <algorithm>
+
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe.cuh>
 
 #include "../../utils/exception.hpp"
+#include "../../utils/math.hpp"
 #include "sm90.hpp"
 
 namespace deep_gemm {
@@ -19,7 +23,7 @@ struct SM90NVFP4H200FusedConfig {
         kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
 
     int block_m, block_n;
-    int num_max_pool_tokens;
+    int num_ring_tokens;
     int num_padded_sf_pool_tokens;
     int num_stages, smem_size;
 };
@@ -52,6 +56,37 @@ struct SM90NVFP4H200FusedShape {
             num_topk == kTopk &&
             hidden == kHidden &&
             intermediate_hidden == kIntermediateHidden;
+    }
+
+    // Ring-buffer capacity for this kernel's L1/L2 activation buffers.
+    // Mirrors the generic MegaMoE buffer sizing's use of
+    // `sched::get_num_max_live_pool_blocks` (see `get_symm_buffer_size_for_mega_moe`
+    // in `mega.hpp`), but iterates this kernel's own BLOCK_M candidates --
+    // {8, 16, 24, 64, 128}, from the tuning table in `select_sm90_nvfp4_h200_fused`
+    // below -- instead of the generic `layout::kCandidateBlockM` set, which
+    // omits 24. `mega.hpp` (buffer creation) and `select_sm90_nvfp4_h200_fused`
+    // (kernel launch, TMA descriptor extents) both call this single function so
+    // they cannot silently drift apart, the way the ported full-pool token count
+    // could (see the buffer-layout fix in commit `f178178`).
+    static int get_num_ring_tokens(
+            int num_ranks, int num_max_tokens_per_rank,
+            int num_topk, int num_experts_per_rank, int num_sms) {
+        static constexpr int kRingCandidateBlockM[] = {8, 16, 24, 64, 128};
+        const int num_active_topk = std::min(num_topk, num_experts_per_rank);
+        const int num_max_routed_tokens =
+            num_max_tokens_per_rank * num_ranks * num_active_topk;
+        int num_ring_tokens = 0;
+        for (const auto block_m : kRingCandidateBlockM) {
+            const auto num_pool_blocks =
+                ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+            const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+                num_pool_blocks, num_sms, kHidden, kIntermediateHidden);
+            num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+        }
+        // All ring candidates divide `layout::kLCMCandidateBlockM` (384), so
+        // this keeps `kNumRingTokens / BLOCK_M` exact for every BLOCK_M this
+        // kernel's tuning table can pick across the buffer's shared lifetime.
+        return align(num_ring_tokens, layout::kLCMCandidateBlockM);
     }
 };
 
@@ -126,9 +161,9 @@ select_sm90_nvfp4_h200_fused(
         {
             tuning.block_m,
             tuning.block_n,
-            layout::get_num_max_pool_tokens(
+            SM90NVFP4H200FusedShape::get_num_ring_tokens(
                 input.num_ranks, input.num_max_tokens_per_rank,
-                input.num_topk, input.num_experts_per_rank),
+                input.num_topk, input.num_experts_per_rank, input.num_sms),
             input.num_padded_sf_pool_tokens,
             tuning.num_stages,
             cute::min(tuning.smem_size +
