@@ -519,12 +519,28 @@
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Token / SF pull loop
+        // NOTES: every dispatch warp must populate its own per-lane
+        // `stored_num_tokens_per_expert`/`num_total_m_blocks` state here, even
+        // when `kSingleActiveDispatchWarp` leaves this warp idle for the rest
+        // of the pull loop below -- `cleanup_workspace()` later calls
+        // `get_pool_block_offset()` from every dispatch thread (both warps) to
+        // find where each expert's data lives in the pool before zeroing its
+        // ring-buffer full/empty counters, and that read is warp-local register
+        // state, not shared across warps. A warp that skipped this fetch would
+        // derive an always-zero offset there and leave the *other* warp's
+        // counters un-zeroed, which the next launch can then wait on forever.
+        // This must happen here (before any cleanup zeroing) rather than
+        // inside `cleanup_workspace()` itself, since that function zeros
+        // `get_expert_recv_count_sum_ptr` per-expert as it goes and a fetch
+        // racing against another SM's cleanup could read an already-zeroed
+        // slot and hang waiting for a completion tag that will never reappear
+        // this launch.
+        interleaved_scheduler.fetch_expert_recv_count();
+
         if (warp_idx < kNumActiveDispatchWarps) {
             uint32_t pull_mbarrier_phase = 0;
             const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
             const auto pull_mbarrier = dispatch_barriers[warp_idx];
-
-            interleaved_scheduler.fetch_expert_recv_count();
 
             constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
             int      current_expert_idx = -1;
