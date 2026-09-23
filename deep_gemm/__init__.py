@@ -56,6 +56,8 @@ try:
         m_grouped_bf16_gemm_nn_contiguous,
         m_grouped_bf16_gemm_nt_masked,
         k_grouped_bf16_gemm_tn_contiguous,
+        # Fused BF16 gate and routing (SM90)
+        bf16_mega_gate, get_bf16_mega_gate_config,
         # Einsum kernels
         einsum,
         fp8_einsum,

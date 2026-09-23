@@ -111,6 +111,71 @@ out_ij = out_ij.sum()  # Scalar
 
 For more details and the paged version `fp8_paged_mqa_logits`, please refer to `tests/test_attention.py`.
 
+#### Mega Gate (SM90)
+
+`bf16_mega_gate` fuses the BF16 router projection and MoE Top-K routing on Hopper,
+with the API and routing semantics from [PR #432](https://github.com/deepseek-ai/DeepGEMM/pull/432).
+
+```python
+# x: contiguous CUDA BF16 [tokens, hidden]
+# weight: contiguous CUDA BF16 [routed_experts, hidden]
+topk_idx, topk_weights = deep_gemm.bf16_mega_gate(
+    x, weight, num_topk=8,
+    use_shared_as_routed=False, num_shared_experts=0,
+    routed_scaling_factor=1.0, ep_rank=0,
+    scoring_func='sigmoid',  # also 'sqrtsoftplus' and 'identity'
+    bias=None,
+)
+```
+
+Hidden size must be a positive multiple of 256; routed experts must be a positive
+multiple of 4, at most 512. Top-K is at most 32 and cannot exceed the expert count.
+Outputs are INT64 indices and FP32 weights. Optional arguments support token masks,
+image-specific bias, fixed/random routing, logical-to-physical expert mapping,
+shared experts, strided `unmapped_topk_idx`, and preallocated `out` tensors.
+Image bias replaces regular bias for image tokens. Bias affects selection only;
+weights use unbiased scores. Masking takes precedence over random routing, which
+takes precedence over fixed routing. See `csrc/apis/mega_gate.hpp` for tensor shapes.
+
+The SM90 implementation selects a path by shape. Small batches use a dedicated
+TMA producer and a WGMMA consumer warpgroup, with full/empty stage barriers adapted
+from the SM100 implementation. Compatible pairs of K stages share one WGMMA commit
+and wait. Computation uses BF16 inputs, FP32 accumulation, and parallel
+expert/Split-K tasks. Their partial logits are reduced in a fixed order by a
+second kernel that also performs all routing operations. When Split-K is 1, the
+custom kernel keeps GEMM and routing fused in one CTA. Larger batches reuse the
+existing tuned SM90 BF16 GEMM and run routing as a second kernel. The default
+large-batch threshold is 256 tokens. This trades one extra launch and FP32
+workspace for substantially more parallelism; it does not use global spin waits
+or shared cached counters.
+
+`get_bf16_mega_gate_config` reports `use_gemm`, `num_split_k`, and the custom
+kernel's tile/stage configuration. When `use_gemm=True`, `block_tokens` and
+`num_stages` are zero because the regular GEMM heuristic selects those separately.
+For experiments, `DG_SM90_MEGA_GATE_USE_GEMM` (0/1),
+`DG_SM90_MEGA_GATE_TOKENS` (8/16/32/64), `DG_SM90_MEGA_GATE_STAGES` (1–8),
+and `DG_SM90_MEGA_GATE_SPLITS` (1–16, dividing hidden/64) override the defaults.
+The split override applies only to the custom path. Stage count is capped by the
+number of K tiles in a partition; configurations exceeding shared-memory capacity
+are rejected. Warm up the JIT before CUDA Graph capture.
+
+`DG_SM90_MEGA_GATE_WARP_SPECIALIZED`, `DG_SM90_MEGA_GATE_MERGE_STAGES`, and
+`DG_SM90_MEGA_GATE_DIRECT_ROUTE` (each 0/1) support performance ablation. Direct
+routing uses the SM100 per-lane `float4` score layout and sums partials in registers;
+the alternative stages reduced scores in shared memory. See
+`docs/mega_gate_sm90_sm100_followup.md` for source mappings and measurements.
+
+Rebuild the C++ extension after updating this branch, then run:
+
+```bash
+python -m pytest tests/test_mega_gate_sm90.py -q
+python tests/bench_mega_gate_sm90.py --output mega_gate_results.json
+```
+
+The benchmark validates outputs and measures the complete operation with warm-cache
+CUDA Graph replay, including the reduction/routing launch. It excludes JIT and
+Python dispatch time; compare against SM100 using the same timing method and inputs.
+
 #### Mega MoE
 
 Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
